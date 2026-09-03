@@ -2,15 +2,17 @@
 
 Transform JSON Schema (Draft 2020-12) into native types and validation schemas for multiple languages. A single Rust core parses any JSON Schema into a target-agnostic intermediate representation (`SchemaIr`), then pluggable emitters generate idiomatic code per language.
 
-| Emitter        | Output                                   | Runtime validation     | Conformance* |
-| -------------- | ---------------------------------------- | ---------------------- | ------------ |
-| **Zod**        | Zod schemas + TypeScript types           | Yes (full)             | 88.8%        |
-| **Pydantic**   | `@pydantic` dataclasses (Pydantic v2)    | Yes                    | 89.7%        |
-| **Swift**      | `Codable` structs + validating wrappers  | Yes (decode-time)      | 89.5%        |
-| **Kotlin**     | `@Serializable` data classes             | Yes (decode-time)      | 86.5%        |
-| **TypeScript** | Pure `.d.ts` type definitions            | No (compile-time only) | n/a          |
+| Emitter        | Output                                  | Runtime validation     | Conformance*         |
+| -------------- | --------------------------------------- | ---------------------- | -------------------- |
+| **Zod**        | Zod schemas + TypeScript types          | Yes (full)             | **100%** (1299/1299) |
+| **Pydantic**   | `@pydantic` dataclasses (Pydantic v2)   | Yes                    | **100%** (1299/1299) |
+| **Swift**      | `Codable` structs + validating wrappers | Yes (decode-time)      | **100%** (1299/1299) |
+| **Kotlin**     | `@Serializable` data classes            | Yes (decode-time)      | **100%** (1299/1299) |
+| **TypeScript** | Pure `.d.ts` type definitions           | No (compile-time only) | n/a                  |
 
-\* Share of the official [JSON-Schema-Test-Suite](https://github.com/json-schema-org/JSON-Schema-Test-Suite) (draft 2020-12, 1,299 test cases — nothing skipped) passing as of the current baseline. The goal is 100%; the biggest shared gaps are `unevaluatedProperties`/`unevaluatedItems`, `$dynamicRef`/`$dynamicAnchor`, `$anchor`, and remote `$ref`s.
+\* The full official [JSON-Schema-Test-Suite](https://github.com/json-schema-org/JSON-Schema-Test-Suite) (draft 2020-12, 1,299 test cases — nothing skipped), measured under the standard draft 2020-12 profile where `format` is annotation-only. Format enforcement is this library's opt-in extension (on by default in the API/CLI; see `Converter::convert_with_options`).
+
+Most schemas compile to fully native validators. Schemas using keywords whose semantics require evaluation-annotation tracking or cross-document reference resolution (`unevaluatedProperties`/`unevaluatedItems`, `$dynamicRef`/`$dynamicAnchor`, `$anchor`, nested `$id` scopes, remote `$ref`s, custom `$schema` dialects) are compiled instead to an embedded, self-contained draft 2020-12 mini-validator per language — same public type, same API, spec-complete semantics.
 
 ## Workspace
 
@@ -57,26 +59,33 @@ jst schema.json --out-dir ./generated
 
 # From stdin, custom naming
 echo '{"type":"string"}' | jst - --target swift --name my-type --namespace api --schema-version 2
+
+# Shared helpers: utilities (validators, wrapper types) go to a separate
+# companion file instead of being inlined into each schema module
+jst schema.json --target zod --out-dir ./generated --helpers-file            # per-language default name
+jst schema.json --target zod --out-dir ./generated --helpers-file utils.ts   # custom name
 ```
 
 Generated root types are named `{PascalName}V{version}Data` to keep multiple schema versions collision-free.
+
+By default every generated module is fully self-contained. With `--helpers-file` (library: `EmitOptions { helpers_file }` and `Emitter::helpers_content()`), shared utilities are emitted once into a companion file — `jst-helpers.ts` / `jst_helpers.py` / `JstHelpers.swift` / `JstHelpers.kt` — and schema modules reference them (imports in TypeScript/Python, same-module internal declarations in Swift/Kotlin). This keeps schema files free of utility noise and avoids duplicated declarations when many generated files are compiled together.
 
 ## Testing
 
 ```bash
 git submodule update --init  # first time: fetch the JSON Schema test suite
-bun scripts/test.ts          # everything: build, unit, fixtures, all 4 conformance suites (~20s)
+bun scripts/test.ts          # everything: build, unit, fixtures, all 4 conformance suites (~45s)
 bun scripts/test.ts --quick  # build + unit tests only
 ```
 
 Conformance testing runs the full official test suite **natively in each output language** — each harness compiles/loads all 383 generated fixture modules once and executes all 1,299 cases in a single process:
 
-| Suite    | Command                          | Approx. time |
-| -------- | -------------------------------- | ------------ |
-| Zod      | `bun run conformance/ts/run.ts`  | < 0.1s       |
-| Pydantic | `conformance/python/run.sh`      | ~0.5s        |
-| Swift    | `conformance/swift/run.sh`       | ~6s (one `swiftc` batch compile) |
-| Kotlin   | `conformance/kotlin/run.sh`      | ~11s (one `kotlinc` batch compile) |
+| Suite    | Command                         | Approx. time                       |
+| -------- | ------------------------------- | ---------------------------------- |
+| Zod      | `bun run conformance/ts/run.ts` | < 0.3s                             |
+| Pydantic | `conformance/python/run.sh`     | ~1s                                |
+| Swift    | `conformance/swift/run.sh`      | ~13s (one `swiftc` batch compile)  |
+| Kotlin   | `conformance/kotlin/run.sh`     | ~25s (one `kotlinc` batch compile) |
 
 Fixtures are produced by `conformance-gen`, which walks `JSON-Schema-Test-Suite/tests/draft2020-12`, converts every test group through every emitter, and writes `conformance/generated/manifest.json` describing each group (type name, generated file per language, expected validity per test). Generation errors are recorded in the manifest and counted as failures by the harnesses — no test is silently skipped.
 
@@ -90,4 +99,4 @@ JSON Schema ──▶ Converter (input.rs) ──▶ SchemaIr (ir.rs) ──▶ 
 
 - **`input.rs`** — Draft 2020-12 parser: `$ref`/`$defs` resolution with cycle detection, `allOf` object merging, `anyOf`/`oneOf` unions, `if`/`then`/`else`, typeless schemas via type-guarded constraints, topological ordering of definitions.
 - **`ir.rs`** — target-agnostic schema IR: primitives with constraints, objects/arrays/tuples/records, unions/intersections, literals/enums, refs, refinement wrappers.
-- **`emit/`** — one emitter per target implementing the `Emitter` trait; shared helpers in `emit/mod.rs`.
+- **`emit/`** — one emitter module per target implementing the `Emitter` trait (`emit/zod/`, `emit/swift/`, ...). Each emitter directory contains its Rust code (`mod.rs`) plus its runtime helper sources as real files in their own language (`jsi_validator.ts`, `email_address.swift`, `jsi_eq.kt`, ...), embedded via `include_str!`.

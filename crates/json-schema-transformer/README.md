@@ -418,17 +418,23 @@ data class UserCreatedV1Data(
 
 ## Spec Compliance
 
-Measured against the official [JSON Schema Test Suite](https://github.com/json-schema-org/JSON-Schema-Test-Suite) (Draft 2020-12) — all 1,299 test cases, nothing skipped. Current baselines:
+Measured against the official [JSON Schema Test Suite](https://github.com/json-schema-org/JSON-Schema-Test-Suite) (Draft 2020-12) — all 1,299 test cases, nothing skipped:
 
 | Emitter      | Pass rate        |
 | ------------ | ---------------- |
-| **Zod**      | 88.8%            |
-| **Pydantic** | 89.7%            |
-| **Swift**    | 89.5%            |
-| **Kotlin**   | 86.5%            |
+| **Zod**      | 100% (1299/1299) |
+| **Pydantic** | 100% (1299/1299) |
+| **Swift**    | 100% (1299/1299) |
+| **Kotlin**   | 100% (1299/1299) |
 | TypeScript   | N/A (no runtime) |
 
-Biggest gaps (all emitters, converter-level): `unevaluatedProperties`/`unevaluatedItems`, `$dynamicRef`/`$dynamicAnchor`, `$anchor`, remote `$ref`s, plus `$id` scope edge cases and per-language `format` validator differences. Per-keyword failure breakdowns live in `conformance/results/<lang>.json` after a conformance run.
+Conformance is measured under the standard draft 2020-12 profile, where `format` is annotation-only. Format enforcement is this library's opt-in extension: on by default (`Converter::convert` / `convert_with_remotes`), disabled via `Converter::convert_with_options(schema, remotes, false)`.
+
+### The interpreted fallback
+
+Most schemas compile to fully native validators. Keywords whose semantics require evaluation-annotation tracking or cross-document reference resolution cannot be expressed as composable per-keyword native validators — `unevaluatedProperties`/`unevaluatedItems`, `$dynamicRef`/`$dynamicAnchor`, `$anchor`, nested `$id` scopes, remote/non-fragment `$ref`s, `$ref: "#"`, custom `$schema` dialects (`$vocabulary`), and `__proto__` property names. The parser routes schemas using any of these to `SchemaIr::Interpreted`, and each emitter embeds the raw schema (plus any remote documents) alongside a self-contained draft 2020-12 mini-validator with full annotation tracking. The generated public type and API are unchanged; only the validation strategy inside differs. Reference implementation: `JSI_HELPER` in `emit/zod.rs`, with ports in `emit/pydantic.rs`, `emit/swift.rs`, and `emit/kotlin.rs`.
+
+Remote `$ref`s resolve against a caller-supplied registry (`Converter::convert_with_remotes(schema, &uri_to_document_map)`); the conformance generator preloads the suite's `remotes/` directory and the official 2020-12 meta-schemas.
 
 ## Testing
 

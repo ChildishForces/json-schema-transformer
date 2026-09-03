@@ -27,7 +27,7 @@ for attempt in 1 2 3 4 5 6; do
   if swiftc -Onone -suppress-warnings -j "$NCPU" \
       -module-name ConformanceRunner \
       -o "$BUILD/runner" \
-      @"$BUILD/sources.txt" Support.swift "$BUILD/main.swift" \
+      @"$BUILD/sources.txt" "$GEN_DIR/swift/JstHelpers.swift" "$BUILD/main.swift" \
       2> "$BUILD/compile.log"; then
     compiled=1
     break

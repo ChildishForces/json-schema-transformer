@@ -11,19 +11,55 @@ pub mod zod;
 
 use crate::ir::ConvertedSchema;
 
+/// Options controlling module emission.
+#[derive(Debug, Clone, Default)]
+pub struct EmitOptions {
+    /// When set, utility helpers (deep-equality, canonical stringify, the
+    /// spec-interpreter, format wrapper types, ...) are NOT emitted inline into
+    /// the module. The module instead references them from this companion file:
+    /// an import in TypeScript/Python, same-module internal declarations in
+    /// Swift/Kotlin. Generate the companion file once via
+    /// [`Emitter::helpers_content`]. The value is the helper file's name,
+    /// e.g. "jst-helpers.ts" (used to derive import paths where relevant).
+    pub helpers_file: Option<String>,
+}
+
 /// Trait for emitting generated code from a converted JSON Schema.
 pub trait Emitter {
     /// File extension for the generated output (e.g., "zod.ts", "d.ts", "py").
     fn extension(&self) -> &str;
 
-    /// Generate the output module/file as a string.
+    /// Generate a self-contained output module (helpers inlined).
     fn emit(
         &self,
         converted: &ConvertedSchema,
         name: &str,
         namespace: &str,
         version: u32,
+    ) -> String {
+        self.emit_with_options(converted, name, namespace, version, &EmitOptions::default())
+    }
+
+    /// Generate the output module honoring [`EmitOptions`].
+    fn emit_with_options(
+        &self,
+        converted: &ConvertedSchema,
+        name: &str,
+        namespace: &str,
+        version: u32,
+        options: &EmitOptions,
     ) -> String;
+
+    /// Full content of this language's shared helpers file (static — identical
+    /// for every schema). None when the language emits no runtime helpers.
+    fn helpers_content(&self) -> Option<String> {
+        None
+    }
+
+    /// Conventional file name for the shared helpers file.
+    fn default_helpers_file(&self) -> Option<&'static str> {
+        None
+    }
 }
 
 // Re-export emitter types

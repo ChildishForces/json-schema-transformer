@@ -1,6 +1,6 @@
 use crate::ir::*;
 use crate::util::{escape_string, to_pascal_case, to_snake_case};
-use super::{Emitter, needs_python_quoting};
+use super::{EmitOptions, Emitter, needs_python_quoting};
 
 pub struct PydanticEmitter;
 
@@ -14,6 +14,7 @@ struct ModuleFeatures {
     needs_model_validator: bool,
     needs_type_helpers: bool,
     needs_deep_equal: bool,
+    needs_interpreter: bool,
 }
 
 impl Emitter for PydanticEmitter {
@@ -21,12 +22,13 @@ impl Emitter for PydanticEmitter {
         "py"
     }
 
-    fn emit(
+    fn emit_with_options(
         &self,
         converted: &ConvertedSchema,
         name: &str,
         namespace: &str,
         version: u32,
+        options: &EmitOptions,
     ) -> String {
         let pascal = to_pascal_case(name);
         let mut features = ModuleFeatures::default();
@@ -55,6 +57,25 @@ impl Emitter for PydanticEmitter {
             &converted.defs,
             &mut counter,
         );
+
+        // Assemble the body (definitions + root) first so that in shared-helpers
+        // mode we can strip the static utility defs and detect which shared
+        // helper names the module actually references.
+        let mut body = String::new();
+        for block in &def_blocks {
+            body.push_str(block);
+            body.push_str("\n\n");
+        }
+        body.push_str(&root_block);
+        body.push('\n');
+
+        if options.helpers_file.is_some() {
+            // The _try_validate/_try_validate_g defs are static — in shared mode
+            // they live in the helpers module instead of being emitted inline.
+            body = body
+                .replace(&format!("\n{TRY_VALIDATE_HELPER}\n"), "\n")
+                .replace(&format!("\n{TRY_VALIDATE_G_HELPER}\n"), "\n");
+        }
 
         let mut out = String::new();
 
@@ -93,31 +114,86 @@ impl Emitter for PydanticEmitter {
             out.push_str("try:\n    import regex as re\nexcept ImportError:\n    import re\n");
         }
 
-        out.push_str("\n");
+        if let Some(helpers_file) = &options.helpers_file {
+            // Shared-helpers mode: import the utilities from the companion
+            // module instead of inlining them.
+            let helper_module = helpers_file.trim_end_matches(".py");
+            let mut names: Vec<&str> = Vec::new();
+            for n in ["_check_str", "_check_int", "_check_number", "_check_bool", "_deep_equal"] {
+                if body.contains(n) {
+                    names.push(n);
+                }
+            }
+            if body.contains("_try_validate(") {
+                names.push("_try_validate");
+            }
+            if body.contains("_try_validate_g(") {
+                names.push("_try_validate_g");
+            }
+            if body.contains("_jsi_validate(") {
+                names.push("_jsi_validate");
+            }
+            if !names.is_empty() {
+                out.push_str(&format!(
+                    "\n# Shared runtime helpers live in {helpers_file} next to this file. Generated\n\
+                     # modules are commonly loaded by file path, so make sure this directory is\n\
+                     # on sys.path before importing them.\n\
+                     import os as _os, sys as _sys\n\
+                     _jst_dir = _os.path.dirname(_os.path.abspath(__file__))\n\
+                     if _jst_dir not in _sys.path:\n    \
+                         _sys.path.insert(0, _jst_dir)\n\
+                     from {helper_module} import {}\n",
+                    names.join(", ")
+                ));
+            }
+            out.push_str("\n");
+        } else {
+            out.push_str("\n");
 
-        // Type strictness helpers
-        if features.needs_type_helpers {
-            out.push_str(TYPE_CHECK_HELPERS);
-            out.push('\n');
+            // Type strictness helpers
+            if features.needs_type_helpers {
+                out.push_str(TYPE_CHECK_HELPERS);
+                out.push('\n');
+            }
+
+            // Deep equality helper (type-aware, so false != 0 and true != 1)
+            if features.needs_deep_equal {
+                out.push_str(DEEP_EQUAL_HELPER);
+                out.push('\n');
+            }
+
+            // Embedded draft 2020-12 interpreter (for SchemaIr::Interpreted roots)
+            if features.needs_interpreter {
+                out.push_str(JSI_PY_HELPER);
+                out.push('\n');
+            }
         }
 
-        // Deep equality helper (type-aware, so false != 0 and true != 1)
-        if features.needs_deep_equal {
-            out.push_str(DEEP_EQUAL_HELPER);
-            out.push('\n');
-        }
-
-        // Definitions
-        for block in &def_blocks {
-            out.push_str(block);
-            out.push_str("\n\n");
-        }
-
-        // Root
-        out.push_str(&root_block);
-        out.push('\n');
+        // Definitions + root
+        out.push_str(&body);
 
         out
+    }
+
+    fn helpers_content(&self) -> Option<String> {
+        let mut s = String::from(
+            "# Generated by json-schema-transformer — shared runtime helpers\n\
+             # DO NOT EDIT — changes will be overwritten on regeneration\n\n\
+             from pydantic import ValidationError\n\n\
+             try:\n    import regex as re\nexcept ImportError:\n    import re\n",
+        );
+        s.push_str(TYPE_CHECK_HELPERS);
+        s.push_str(DEEP_EQUAL_HELPER);
+        s.push('\n');
+        s.push_str(TRY_VALIDATE_HELPER);
+        s.push('\n');
+        s.push_str(TRY_VALIDATE_G_HELPER);
+        s.push_str(JSI_PY_HELPER);
+        Some(s)
+    }
+
+    fn default_helpers_file(&self) -> Option<&'static str> {
+        Some("jst_helpers.py")
     }
 }
 
@@ -125,6 +201,12 @@ impl Emitter for PydanticEmitter {
 
 fn scan_features(ir: &SchemaIr, f: &mut ModuleFeatures) {
     match ir {
+        SchemaIr::Interpreted { .. } => {
+            f.needs_before_validator = true;
+            f.needs_json = true;
+            f.needs_re = true;
+            f.needs_interpreter = true;
+        }
         SchemaIr::String(_) | SchemaIr::Number(_) | SchemaIr::Integer(_)
         | SchemaIr::Boolean | SchemaIr::Literal(_) => {
             f.needs_before_validator = true;
@@ -236,6 +318,7 @@ fn scan_features(ir: &SchemaIr, f: &mut ModuleFeatures) {
             if !o.pattern_properties.is_empty() {
                 f.needs_re = true;
                 f.needs_model_validator = true;
+                f.needs_type_adapter = true;
             }
             if o.property_names.is_some() {
                 f.needs_model_validator = true;
@@ -344,6 +427,9 @@ fn emit_definition(
     counter: &mut usize,
 ) -> String {
     match ir {
+        SchemaIr::Interpreted { schema, remotes } => {
+            emit_interpreted(name, schema, remotes, counter)
+        }
         SchemaIr::Object(obj) => emit_object_class(name, obj, defs, counter),
         SchemaIr::TypeGuarded(guards) => emit_type_guarded(name, guards, defs, counter),
         SchemaIr::Not { base, not_schema } => emit_not(name, base, not_schema, defs, counter),
@@ -1117,9 +1203,7 @@ fn emit_array_guard_checks(
             }
 
             // Ensure the _try_validate_g helper is defined
-            preamble.push_str(
-                "\ndef _try_validate_g(ta, v):\n    try:\n        ta.validate_python(v)\n        return True\n    except Exception:\n        return False\n\n",
-            );
+            preamble.push_str(&format!("\n{TRY_VALIDATE_G_HELPER}\n"));
         }
 
         // Items type validation
@@ -1580,9 +1664,7 @@ fn emit_constrained_array(
         }
 
         // Add the _try_validate helper if not already present
-        out.push_str(
-            "\ndef _try_validate(ta, v):\n    try:\n        ta.validate_python(v)\n        return True\n    except (ValidationError, ValueError, TypeError):\n        return False\n\n",
-        );
+        out.push_str(&format!("\n{TRY_VALIDATE_HELPER}\n"));
     }
 
     if validator_checks.is_empty() {
@@ -1755,6 +1837,49 @@ fn emit_never(name: &str, counter: &mut usize) -> String {
     )
 }
 
+// ── Interpreted emission ────────────────────────────────────────────────────
+
+/// Embed the raw schema + remote documents as JSON and validate with the
+/// emitted `_jsi_validate` interpreter (see JSI_PY_HELPER).
+fn emit_interpreted(
+    name: &str,
+    schema: &serde_json::Value,
+    remotes: &[(String, serde_json::Value)],
+    counter: &mut usize,
+) -> String {
+    *counter += 1;
+    let n = *counter;
+
+    // Double-encode: json.loads of a JSON string literal. serde_json only emits
+    // \", \\ and \uXXXX escapes, all of which mean the same thing in a Python
+    // double-quoted string literal.
+    let schema_json = serde_json::to_string(schema).unwrap_or_else(|_| "true".to_string());
+    let schema_literal =
+        serde_json::to_string(&serde_json::Value::String(schema_json)).unwrap();
+    let remotes_json = {
+        let map: serde_json::Map<String, serde_json::Value> = remotes
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        serde_json::to_string(&serde_json::Value::Object(map))
+            .unwrap_or_else(|_| "{}".to_string())
+    };
+    let remotes_literal =
+        serde_json::to_string(&serde_json::Value::String(remotes_json)).unwrap();
+
+    format!(
+        "_jsi_schema_{n} = json.loads({schema_literal})\n\
+         _jsi_remotes_{n} = json.loads({remotes_literal})\n\
+         \n\
+         def _jsi_check_{n}(v):\n    \
+             if not _jsi_validate(_jsi_schema_{n}, _jsi_remotes_{n}, v):\n        \
+                 raise ValueError('does not match schema')\n    \
+             return v\n\
+         \n\
+         {name} = Annotated[Any, BeforeValidator(_jsi_check_{n})]"
+    )
+}
+
 // ── Sub-schema emission ─────────────────────────────────────────────────────
 
 fn emit_sub_schema(
@@ -1810,12 +1935,17 @@ fn emit_sub_schema(
 
 fn py_type(ir: &SchemaIr, defs: &[DefEntry]) -> String {
     match ir {
-        SchemaIr::String(_) => "str".to_string(),
-        SchemaIr::Number(_) => "float".to_string(),
-        SchemaIr::Integer(_) => "int".to_string(),
-        SchemaIr::Boolean => "bool".to_string(),
+        // Strict scalars: JSON Schema forbids pydantic's lax coercions
+        // ("1" -> 1.0, True -> 1, 1 -> "1"), so every scalar annotation
+        // carries its type-check BeforeValidator even when nested.
+        SchemaIr::String(_) => "Annotated[str, BeforeValidator(_check_str)]".to_string(),
+        SchemaIr::Number(_) => "Annotated[float, BeforeValidator(_check_number)]".to_string(),
+        SchemaIr::Integer(_) => "Annotated[int, BeforeValidator(_check_int)]".to_string(),
+        SchemaIr::Boolean => "Annotated[bool, BeforeValidator(_check_bool)]".to_string(),
         SchemaIr::Null => "None".to_string(),
-        SchemaIr::Any | SchemaIr::Unknown => "Any".to_string(),
+        // Interpreted is handled in emit_definition (root-level only); as a bare
+        // type annotation it degrades to Any.
+        SchemaIr::Any | SchemaIr::Unknown | SchemaIr::Interpreted { .. } => "Any".to_string(),
         SchemaIr::Never => "Any".to_string(),
 
         SchemaIr::Literal(lit) => match lit {
@@ -1972,49 +2102,21 @@ fn format_py_number(n: f64) -> String {
 // ── Python helper constants ─────────────────────────────────────────────────
 
 /// Type strictness helpers — JSON Schema requires bool != int, string != number, etc.
-const TYPE_CHECK_HELPERS: &str = r#"
-def _check_str(v):
-    if not isinstance(v, str):
-        raise ValueError("not a string")
-    return v
+const TYPE_CHECK_HELPERS: &str = include_str!("type_checks.py");
 
-def _check_int(v):
-    if isinstance(v, bool):
-        raise ValueError("boolean is not an integer")
-    if isinstance(v, int):
-        return v
-    if isinstance(v, float) and v == int(v) and not (v != v):
-        return v
-    raise ValueError("not an integer")
-
-def _check_number(v):
-    if isinstance(v, bool):
-        raise ValueError("boolean is not a number")
-    if not isinstance(v, (int, float)):
-        raise ValueError("not a number")
-    return v
-
-def _check_bool(v):
-    if not isinstance(v, bool):
-        raise ValueError("not a boolean")
-    return v
-"#;
+/// Self-contained draft 2020-12 validator with annotation tracking, used for
+/// schemas routed to SchemaIr::Interpreted (unevaluatedProperties/Items,
+/// $dynamicRef/$dynamicAnchor, $anchor, nested $id scopes, remote $refs).
+/// Python port of the JSI_HELPER TypeScript interpreter in zod.rs.
+const JSI_PY_HELPER: &str = include_str!("jsi_validator.py");
 
 /// Deep equality that distinguishes types (false != 0, true != 1, 1 != 1.0 for containers)
-const DEEP_EQUAL_HELPER: &str = r#"
-def _deep_equal(a, b):
-    if type(a) is not type(b):
-        # Allow int/float comparison for numeric equality only at leaf level
-        if isinstance(a, (int, float)) and isinstance(b, (int, float)) and not isinstance(a, bool) and not isinstance(b, bool):
-            return a == b
-        return False
-    if isinstance(a, dict):
-        if set(a.keys()) != set(b.keys()):
-            return False
-        return all(_deep_equal(a[k], b[k]) for k in a)
-    if isinstance(a, list):
-        if len(a) != len(b):
-            return False
-        return all(_deep_equal(ai, bi) for ai, bi in zip(a, b))
-    return a == b
-"#;
+const DEEP_EQUAL_HELPER: &str = include_str!("deep_equal.py");
+
+/// Static "does this value validate?" probe used by `contains` checks on
+/// constrained arrays/tuples. Schema-independent, so it moves to the shared
+/// helpers file in shared-helpers mode.
+const TRY_VALIDATE_HELPER: &str = "def _try_validate(ta, v):\n    try:\n        ta.validate_python(v)\n        return True\n    except (ValidationError, ValueError, TypeError):\n        return False\n";
+
+/// Variant used inside type-guard validators (broader exception net).
+const TRY_VALIDATE_G_HELPER: &str = "def _try_validate_g(ta, v):\n    try:\n        ta.validate_python(v)\n        return True\n    except Exception:\n        return False\n";

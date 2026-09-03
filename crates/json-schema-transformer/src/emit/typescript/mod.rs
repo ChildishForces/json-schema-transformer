@@ -1,6 +1,6 @@
 use crate::ir::*;
 use crate::util::{escape_string, to_pascal_case};
-use super::{Emitter, module_header, needs_quoting};
+use super::{EmitOptions, Emitter, module_header, needs_quoting};
 
 pub struct TypeScriptEmitter;
 
@@ -9,12 +9,13 @@ impl Emitter for TypeScriptEmitter {
         "d.ts"
     }
 
-    fn emit(
+    fn emit_with_options(
         &self,
         converted: &ConvertedSchema,
         name: &str,
         namespace: &str,
         version: u32,
+        _options: &EmitOptions,
     ) -> String {
         let pascal = to_pascal_case(name);
         let mut out = module_header(namespace, name, version);
@@ -71,7 +72,7 @@ fn ts_type_indented(ir: &SchemaIr, defs: &[DefEntry], depth: usize) -> String {
         SchemaIr::Number(_) | SchemaIr::Integer(_) => "number".to_string(),
         SchemaIr::Boolean => "boolean".to_string(),
         SchemaIr::Null => "null".to_string(),
-        SchemaIr::Any | SchemaIr::Unknown => "unknown".to_string(),
+        SchemaIr::Any | SchemaIr::Unknown | SchemaIr::Interpreted { .. } => "unknown".to_string(),
         SchemaIr::Never => "never".to_string(),
 
         SchemaIr::Literal(lit) => match lit {

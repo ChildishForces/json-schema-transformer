@@ -7,21 +7,26 @@
 // Groups whose generated file is excluded get no decoder entry; the runner
 // marks all of their tests as failed with the recorded reason.
 
-const fs = require("fs");
+const fs = require('fs');
 
 const [manifestPath, exclusionsPath, outPath] = process.argv.slice(2);
 if (!manifestPath || !exclusionsPath || !outPath) {
-  console.error("usage: bun gen-runner.js <manifest.json> <exclusions.json> <out-Runner.kt>");
+  console.error('usage: bun gen-runner.js <manifest.json> <exclusions.json> <out-Runner.kt>');
   process.exit(2);
 }
 
-const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
-const exclusions = JSON.parse(fs.readFileSync(exclusionsPath, "utf8"));
+const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+const exclusions = JSON.parse(fs.readFileSync(exclusionsPath, 'utf8'));
 const excludedFiles = exclusions.files || {};
 
 const kotlinEscape = (s) =>
-  s.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\$/g, "\\$")
-   .replace(/\n/g, "\\n").replace(/\r/g, "\\r").replace(/\t/g, "\\t");
+  s
+    .replace(/\\/g, '\\\\')
+    .replace(/"/g, '\\"')
+    .replace(/\$/g, '\\$')
+    .replace(/\n/g, '\\n')
+    .replace(/\r/g, '\\r')
+    .replace(/\t/g, '\\t');
 
 const decoderEntries = []; // [typeName]
 const excludedEntries = []; // [typeName, reason]
@@ -33,9 +38,9 @@ for (const g of manifest.groups) {
   seen.add(typeName);
   const ktFile = (g.files || {}).kotlin; // e.g. "kotlin/RefG35.kt"
   const genError = (g.errors || {}).kotlin;
-  const base = ktFile ? ktFile.split("/").pop() : null;
+  const base = ktFile ? ktFile.split('/').pop() : null;
   if (genError || !ktFile) {
-    excludedEntries.push([typeName, `generation error: ${genError || "no kotlin file"}`]);
+    excludedEntries.push([typeName, `generation error: ${genError || 'no kotlin file'}`]);
   } else if (base in excludedFiles) {
     excludedEntries.push([typeName, `excluded from compilation: ${excludedFiles[base]}`]);
   } else {
@@ -73,7 +78,7 @@ chunks.forEach((chunk, i) => {
   out += `private fun decoders${i}(): Map<String, (String) -> Unit> = mapOf(\n`;
   out += chunk
     .map((t) => `    "${t}" to { j -> strictJson.decodeFromString<${t}>(j) }`)
-    .join(",\n");
+    .join(',\n');
   out += `\n)\n\n`;
 });
 
@@ -86,7 +91,7 @@ out += `}\n\n`;
 out += `private val excluded: Map<String, String> = mapOf(\n`;
 out += excludedEntries
   .map(([t, r]) => `    "${kotlinEscape(t)}" to "${kotlinEscape(r)}"`)
-  .join(",\n");
+  .join(',\n');
 out += `\n)\n`;
 
 out += `

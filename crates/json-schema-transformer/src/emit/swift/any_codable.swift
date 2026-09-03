@@ -1,10 +1,3 @@
-// Shared runtime support for the Swift conformance harness.
-// Generated fixture files reference `AnyCodable` (internal, single definition
-// for the whole module) — all other shared helpers are file-private in the
-// generated files themselves.
-
-import Foundation
-
 struct AnyCodable: Codable {
     let value: Any
 

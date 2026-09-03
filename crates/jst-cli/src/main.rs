@@ -3,9 +3,10 @@ use std::path::PathBuf;
 
 use anyhow::{Context, bail};
 use clap::{Parser, ValueEnum};
+use json_schema_transformer::emit::EmitOptions;
+use json_schema_transformer::input::Converter;
 use json_schema_transformer::{
     Emitter, KotlinEmitter, PydanticEmitter, SwiftEmitter, TypeScriptEmitter, ZodEmitter,
-    transform,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -70,6 +71,13 @@ struct Args {
     /// Write single-target output to this file (default: stdout)
     #[arg(short, long, conflicts_with = "out_dir")]
     out: Option<PathBuf>,
+
+    /// Emit shared utility helpers (validators, wrapper types) into a separate
+    /// companion file instead of inlining them into each schema module. Pass a
+    /// filename to override the per-language default (e.g. jst-helpers.ts).
+    /// Requires --out or --out-dir.
+    #[arg(long, num_args = 0..=1, default_missing_value = "", value_name = "FILENAME")]
+    helpers_file: Option<String>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -115,11 +123,49 @@ fn main() -> anyhow::Result<()> {
     if targets.len() > 1 && args.out_dir.is_none() {
         bail!("multiple targets require --out-dir");
     }
+    if args.helpers_file.is_some() && args.out.is_none() && args.out_dir.is_none() {
+        bail!("--helpers-file requires --out or --out-dir");
+    }
+    if let Some(custom) = &args.helpers_file {
+        if !custom.is_empty() && targets.len() > 1 {
+            bail!("a custom --helpers-file name only makes sense with a single target; omit the value to use per-language defaults");
+        }
+    }
+
+    let converted = Converter::convert(&schema).context("conversion failed")?;
+    let helper_dir = args
+        .out_dir
+        .clone()
+        .or_else(|| args.out.as_ref().and_then(|o| o.parent().map(|p| p.to_path_buf())));
 
     for target in &targets {
         let emitter = target.emitter();
-        let output = transform(&schema, emitter.as_ref(), &name, &args.namespace, args.schema_version)
-            .with_context(|| format!("conversion failed for target {target:?}"))?;
+
+        // Resolve helper-file name for this emitter (custom, or language default)
+        let helpers_file = match &args.helpers_file {
+            Some(custom) if !custom.is_empty() => Some(custom.clone()),
+            Some(_) => emitter.default_helpers_file().map(|s| s.to_string()),
+            None => None,
+        };
+        let options = EmitOptions { helpers_file: helpers_file.clone() };
+
+        let output = emitter.emit_with_options(
+            &converted,
+            &name,
+            &args.namespace,
+            args.schema_version,
+            &options,
+        );
+
+        if let (Some(filename), Some(content)) = (&helpers_file, emitter.helpers_content()) {
+            let dir = helper_dir.clone().unwrap_or_else(|| PathBuf::from("."));
+            std::fs::create_dir_all(&dir)
+                .with_context(|| format!("failed to create {}", dir.display()))?;
+            let path = dir.join(filename);
+            std::fs::write(&path, &content)
+                .with_context(|| format!("failed to write {}", path.display()))?;
+            eprintln!("wrote {}", path.display());
+        }
 
         if let Some(dir) = &args.out_dir {
             std::fs::create_dir_all(dir)

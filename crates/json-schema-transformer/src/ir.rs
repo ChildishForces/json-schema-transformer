@@ -60,6 +60,18 @@ pub enum SchemaIr {
     /// JSON Schema keywords only apply to their matching type; other types pass through.
     TypeGuarded(Vec<(TypeGuard, Box<SchemaIr>)>),
 
+    /// Schema that requires full spec-interpreter validation because it uses
+    /// evaluation-order-dependent or reference-resolution keywords that cannot be
+    /// expressed as composable native validators (unevaluatedProperties/Items,
+    /// $dynamicRef/$dynamicAnchor, $anchor, nested $id scopes, remote $refs).
+    /// Emitters embed the raw schema plus remote documents and validate with an
+    /// emitted, self-contained draft 2020-12 mini-validator.
+    Interpreted {
+        schema: serde_json::Value,
+        /// URI → document, for remote references
+        remotes: Vec<(String, serde_json::Value)>,
+    },
+
     // Fallback
     Unknown,
 }

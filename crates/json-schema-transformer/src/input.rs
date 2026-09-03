@@ -23,8 +23,168 @@ pub struct Converter {
     base_uri: Option<String>,
 }
 
+/// Keywords whose semantics depend on evaluation tracking or reference resolution
+/// that native per-keyword codegen cannot express. Schemas using them are routed
+/// to `SchemaIr::Interpreted`.
+const STANDARD_DIALECT: &str = "https://json-schema.org/draft/2020-12/schema";
+
+fn needs_interpreter(schema: &Value, is_root: bool) -> bool {
+    match schema {
+        Value::Object(obj) => {
+            for (key, value) in obj {
+                match key.as_str() {
+                    // Values of these keywords are data, not schemas — never inspect
+                    "const" | "enum" | "default" | "examples" => continue,
+                    "unevaluatedProperties" | "unevaluatedItems" | "$dynamicRef"
+                    | "$dynamicAnchor" | "$recursiveRef" | "$recursiveAnchor" | "$anchor" => {
+                        return true;
+                    }
+                    "$id" if !is_root => return true,
+                    // Custom dialects can disable keyword vocabularies
+                    "$schema" => {
+                        if value.as_str().is_some_and(|s| s != STANDARD_DIALECT) {
+                            return true;
+                        }
+                    }
+                    "$ref" => {
+                        if let Some(r) = value.as_str() {
+                            // Remote, root-self-reference, or empty-token pointers
+                            // are all beyond native $defs-based codegen
+                            if !r.starts_with('#')
+                                || r == "#"
+                                || r.contains("//")
+                                || (r.len() > 1 && r.ends_with('/'))
+                            {
+                                return true;
+                            }
+                        }
+                    }
+                    // __proto__ cannot be represented as a plain JS object key
+                    "required" => {
+                        if let Some(arr) = value.as_array() {
+                            if arr.iter().any(|v| v.as_str() == Some("__proto__")) {
+                                return true;
+                            }
+                        }
+                    }
+                    // Keys of these maps are property names / def names, not keywords
+                    "properties" | "patternProperties" | "$defs" | "definitions"
+                    | "dependentSchemas" => {
+                        if let Some(map) = value.as_object() {
+                            if key == "properties" && map.contains_key("__proto__") {
+                                return true;
+                            }
+                            for sub in map.values() {
+                                if needs_interpreter(sub, false) {
+                                    return true;
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    _ => {}
+                }
+                if needs_interpreter(value, false) {
+                    return true;
+                }
+            }
+            false
+        }
+        Value::Array(items) => items.iter().any(|v| needs_interpreter(v, false)),
+        _ => false,
+    }
+}
+
+/// True if the schema references documents outside itself (non-fragment $ref /
+/// $dynamicRef, or nested $id resources that relative refs may resolve against).
+fn references_external_docs(schema: &Value, is_root: bool) -> bool {
+    match schema {
+        Value::Object(obj) => {
+            for (key, value) in obj {
+                match key.as_str() {
+                    "const" | "enum" | "default" | "examples" => continue,
+                    "$ref" | "$dynamicRef" => {
+                        if let Some(r) = value.as_str() {
+                            if !r.starts_with('#') {
+                                return true;
+                            }
+                        }
+                    }
+                    "$id" if !is_root => return true,
+                    // Custom dialects resolve their $vocabulary from the meta-schema doc
+                    "$schema" => {
+                        if value.as_str().is_some_and(|s| s != STANDARD_DIALECT) {
+                            return true;
+                        }
+                    }
+                    _ => {}
+                }
+                if references_external_docs(value, false) {
+                    return true;
+                }
+            }
+            false
+        }
+        Value::Array(items) => items.iter().any(|v| references_external_docs(v, false)),
+        _ => false,
+    }
+}
+
 impl Converter {
     pub fn convert(root: &Value) -> Result<ConvertedSchema, ConvertError> {
+        Self::convert_with_remotes(root, &HashMap::new())
+    }
+
+    /// Convert with a registry of remote schema documents (URI → document) that
+    /// non-fragment `$ref`s may resolve against. Schemas that use
+    /// evaluation-tracking or cross-document keywords are routed to
+    /// `SchemaIr::Interpreted` with the relevant remote documents embedded.
+    pub fn convert_with_remotes(
+        root: &Value,
+        remotes: &HashMap<String, Value>,
+    ) -> Result<ConvertedSchema, ConvertError> {
+        Self::convert_with_options(root, remotes, true)
+    }
+
+    /// Like `convert_with_remotes`, with control over `format` handling.
+    /// Draft 2020-12 treats `format` as annotation-only by default; this library
+    /// enforces formats unless `enforce_formats` is false.
+    pub fn convert_with_options(
+        root: &Value,
+        remotes: &HashMap<String, Value>,
+        enforce_formats: bool,
+    ) -> Result<ConvertedSchema, ConvertError> {
+        ENFORCE_FORMATS.set(enforce_formats);
+        let result = Self::convert_inner(root, remotes);
+        ENFORCE_FORMATS.set(true);
+        result
+    }
+
+    fn convert_inner(
+        root: &Value,
+        remotes: &HashMap<String, Value>,
+    ) -> Result<ConvertedSchema, ConvertError> {
+        if needs_interpreter(root, true) {
+            let embedded = if references_external_docs(root, true) {
+                let mut entries: Vec<(String, Value)> =
+                    remotes.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                entries.sort_by(|a, b| a.0.cmp(&b.0));
+                entries
+            } else {
+                Vec::new()
+            };
+            return Ok(ConvertedSchema {
+                defs: Vec::new(),
+                root: SchemaIr::Interpreted {
+                    schema: root.clone(),
+                    remotes: embedded,
+                },
+            });
+        }
+        Self::convert_native(root)
+    }
+
+    fn convert_native(root: &Value) -> Result<ConvertedSchema, ConvertError> {
         // Extract root $id as the initial base URI
         let root_id = root
             .as_object()
@@ -1144,6 +1304,9 @@ fn collect_refs_inner(ir: &SchemaIr, out: &mut HashSet<String>) {
         SchemaIr::Lazy(_) => {
             // Back-edge — skip to avoid false dependency cycles.
         }
+        SchemaIr::Interpreted { .. } => {
+            // Self-contained — carries its own schema and remotes, no def edges.
+        }
         SchemaIr::Array(a) => {
             collect_refs_inner(&a.items, out);
             if let Some(c) = &a.contains {
@@ -1416,9 +1579,13 @@ fn is_object_schema(schema: &Value) -> bool {
     obj.contains_key("properties")
 }
 
+thread_local! {
+    /// Whether `format` maps to validating types/checks. Reset by convert_with_options.
+    static ENFORCE_FORMATS: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
 fn parse_string_constraints(obj: &serde_json::Map<String, Value>) -> StringConstraints {
-    let format = obj
-        .get("format")
+    let format = if ENFORCE_FORMATS.get() { obj.get("format") } else { None }
         .and_then(|v| v.as_str())
         .and_then(|f| match f {
             "email" | "idn-email" => Some(StringFormat::Email),

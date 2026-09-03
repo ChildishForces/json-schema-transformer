@@ -107,10 +107,12 @@ mod tests {
 
     #[test]
     fn string_min_max() {
-        assert_eq!(
-            zod(json!({"type": "string", "minLength": 1, "maxLength": 50})),
-            "z.string().min(1).max(50)"
-        );
+        // Length checks count Unicode code points, so they use a superRefine
+        let result = zod(json!({"type": "string", "minLength": 1, "maxLength": 50}));
+        assert!(result.starts_with("z.string().superRefine("));
+        assert!(result.contains("Array.from(v).length"));
+        assert!(result.contains("n < 1"));
+        assert!(result.contains("n > 50"));
     }
 
     #[test]

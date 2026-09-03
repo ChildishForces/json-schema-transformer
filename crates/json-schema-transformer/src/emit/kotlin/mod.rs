@@ -1,6 +1,6 @@
 use crate::ir::*;
 use crate::util::to_pascal_case;
-use super::Emitter;
+use super::{EmitOptions, Emitter};
 
 pub struct KotlinEmitter;
 
@@ -9,12 +9,13 @@ impl Emitter for KotlinEmitter {
         "kt"
     }
 
-    fn emit(
+    fn emit_with_options(
         &self,
         converted: &ConvertedSchema,
         name: &str,
         namespace: &str,
         version: u32,
+        options: &EmitOptions,
     ) -> String {
         let pascal = to_pascal_case(name);
         let mut out = String::new();
@@ -46,18 +47,31 @@ impl Emitter for KotlinEmitter {
         ));
         body.push('\n');
 
+        // Shared-helpers mode: utilities live in the fixed `jst.helpers`
+        // package (see helpers_content) instead of being inlined per file.
+        let shared = options.helpers_file.is_some();
+
         // Determine which imports are actually needed
-        let needs_serial_name = body.contains("@SerialName(");
-        let needs_json_element = body.contains("JsonElement");
+        let needs_interpreter = body.contains("_jsiValidate(");
+        let needs_eq = body.contains("_jsiEq(") || needs_interpreter;
+        let needs_lenient = body.contains("_lenientJson");
         let needs_canonicalize = body.contains("_canonicalize(");
-        let needs_json_object = body.contains("JsonObject") || needs_canonicalize;
+        // Helpers inlined into this file (never in shared mode) pull in
+        // kotlinx.serialization.json types beyond what the body itself uses.
+        let inline_eq = needs_eq && !shared;
+        let inline_canonicalize = needs_canonicalize && !shared;
+        let needs_serial_name = body.contains("@SerialName(");
+        let needs_json_element = body.contains("JsonElement") || inline_eq;
+        let needs_json_object = body.contains("JsonObject") || inline_canonicalize || inline_eq;
         let needs_json_primitive = body.contains("JsonPrimitive")
             || body.contains("jsonPrimitive")
-            || body.contains("JsonNull");
-        let needs_json_array = body.contains("JsonArray") || body.contains("jsonArray");
+            || body.contains("JsonNull")
+            || inline_eq;
+        let needs_json_array = body.contains("JsonArray") || body.contains("jsonArray") || inline_eq;
         let needs_kserializer = body.contains("KSerializer");
         let needs_json_content = body.contains("JsonContentPolymorphicSerializer")
             || body.contains("jsonObject");
+        let needs_decode_from_element = body.contains("decodeFromJsonElement<");
 
         if needs_serial_name {
             out.push_str("import kotlinx.serialization.SerialName\n");
@@ -90,23 +104,125 @@ impl Emitter for KotlinEmitter {
             out.push_str("import kotlinx.serialization.json.JsonArray\n");
             out.push_str("import kotlinx.serialization.json.jsonArray\n");
         }
+        if needs_decode_from_element {
+            out.push_str("import kotlinx.serialization.json.decodeFromJsonElement\n");
+        }
+        if shared {
+            // Reference helpers declared once in the companion file's fixed
+            // `jst.helpers` package (canonical names — no per-file mangling).
+            if needs_canonicalize {
+                out.push_str("import jst.helpers._canonicalize\n");
+            }
+            if body.contains("_jsiEq(") {
+                out.push_str("import jst.helpers._jsiEq\n");
+            }
+            if needs_interpreter {
+                out.push_str("import jst.helpers._jsiValidate\n");
+            }
+            if needs_lenient {
+                out.push_str("import jst.helpers._lenientJson\n");
+            }
+        }
         out.push('\n');
 
-        // Emit helper functions
-        if body.contains("_canonicalize(") {
-            out.push_str(concat!(
-                "private fun _canonicalize(el: JsonElement): String = when (el) {\n",
-                "    is JsonObject -> \"{\" + el.entries.sortedBy { it.key }.joinToString(\",\") { \"\\\"${it.key}\\\":${_canonicalize(it.value)}\" } + \"}\"\n",
-                "    is JsonArray -> \"[\" + el.joinToString(\",\") { _canonicalize(it) } + \"]\"\n",
-                "    else -> el.toString()\n",
-                "}\n\n",
-            ));
+        // Emit helper functions (inline mode only)
+        if !shared {
+            if needs_canonicalize {
+                out.push_str(CANONICALIZE_KT);
+                out.push('\n');
+            }
+            if needs_lenient {
+                out.push_str(LENIENT_JSON_KT);
+                out.push('\n');
+            }
+            if needs_eq {
+                out.push_str(EQ_HELPER_KT);
+                out.push_str("\n\n");
+            }
+            if needs_interpreter {
+                // Top-level classes are package-scoped on the JVM even when
+                // `private`, so mangle the helper class names with the file's
+                // root type name to keep the single-module batch compile happy.
+                let helper = JSI_HELPER_KT
+                    .replace("_JsiAnn", &format!("_{pascal}JsiAnn"))
+                    .replace("_JsiV", &format!("_{pascal}JsiV"));
+                out.push_str(&helper);
+                out.push_str("\n\n");
+            }
         }
 
         out.push_str(&body);
         out
     }
+
+    fn helpers_content(&self) -> Option<String> {
+        let mut s = String::from(concat!(
+            "// Generated by json-schema-transformer — shared runtime helpers\n",
+            "// DO NOT EDIT — changes will be overwritten on regeneration\n\n",
+            "package jst.helpers\n\n",
+            "import kotlinx.serialization.json.*\n\n",
+        ));
+        s.push_str(&internalize(CANONICALIZE_KT));
+        s.push('\n');
+        s.push_str(&internalize(LENIENT_JSON_KT));
+        s.push('\n');
+        s.push_str(&internalize(EQ_HELPER_KT));
+        s.push_str("\n\n");
+        s.push_str(&internalize(JSI_HELPER_KT));
+        s.push('\n');
+        Some(s)
+    }
+
+    fn default_helpers_file(&self) -> Option<&'static str> {
+        Some("JstHelpers.kt")
+    }
 }
+
+/// Rewrite top-level `private` declarations to `internal` so the shared
+/// helpers file (fixed `jst.helpers` package) is visible from generated
+/// schema files compiled in the same module. Members inside classes are
+/// indented and left untouched.
+fn internalize(src: &str) -> String {
+    let mut out: String = src
+        .lines()
+        .map(|l| {
+            if let Some(rest) = l.strip_prefix("private ") {
+                format!("internal {rest}\n")
+            } else {
+                format!("{l}\n")
+            }
+        })
+        .collect();
+    if !src.ends_with('\n') {
+        out.pop();
+    }
+    out
+}
+
+/// Canonical JSON string for uniqueItems comparison (object keys sorted).
+const CANONICALIZE_KT: &str = concat!(
+    "private fun _canonicalize(el: JsonElement): String = when (el) {\n",
+    "    is JsonObject -> \"{\" + el.entries.sortedBy { it.key }.joinToString(\",\") { \"\\\"${it.key}\\\":${_canonicalize(it.value)}\" } + \"}\"\n",
+    "    is JsonArray -> \"[\" + el.joinToString(\",\") { _canonicalize(it) } + \"]\"\n",
+    "    else -> el.toString()\n",
+    "}\n",
+);
+
+/// Lenient Json instance used when delegating validation to a referenced
+/// type's serializer.
+const LENIENT_JSON_KT: &str =
+    "private val _lenientJson = kotlinx.serialization.json.Json { ignoreUnknownKeys = true }\n";
+
+/// JSON-value equality per JSON Schema: numbers compare mathematically
+/// (1 == 1.0) but true != 1 and "1" != 1. Exact content comparison is tried
+/// first so big integers beyond double precision still compare correctly.
+const EQ_HELPER_KT: &str = include_str!("jsi_eq.kt");
+
+/// Self-contained draft 2020-12 validator with annotation tracking, used for
+/// schemas routed to SchemaIr::Interpreted (unevaluatedProperties/Items,
+/// $dynamicRef/$dynamicAnchor, $anchor, nested $id scopes, remote $refs).
+/// Kotlin port of the JSI_HELPER reference implementation in zod.rs.
+const JSI_HELPER_KT: &str = include_str!("jsi_validator.kt");
 
 // ── Kotlin string escaping ───────────────────────────────────────────────────
 
@@ -125,6 +241,55 @@ fn escape_string(s: &str) -> String {
             other => vec![other],
         })
         .collect()
+}
+
+/// Translate ECMAScript-style Unicode property escapes (e.g. `\\p{Letter}`)
+/// into the short general-category forms java.util.regex understands (`\\p{L}`).
+fn translate_pattern(p: &str) -> String {
+    const MAP: &[(&str, &str)] = &[
+        ("Letter", "L"), ("Lowercase_Letter", "Ll"), ("Uppercase_Letter", "Lu"),
+        ("Titlecase_Letter", "Lt"), ("Modifier_Letter", "Lm"), ("Other_Letter", "Lo"),
+        ("Mark", "M"), ("Nonspacing_Mark", "Mn"), ("Spacing_Mark", "Mc"), ("Enclosing_Mark", "Me"),
+        ("Number", "N"), ("Decimal_Number", "Nd"), ("digit", "Nd"), ("Letter_Number", "Nl"),
+        ("Other_Number", "No"), ("Punctuation", "P"), ("Connector_Punctuation", "Pc"),
+        ("Dash_Punctuation", "Pd"), ("Open_Punctuation", "Ps"), ("Close_Punctuation", "Pe"),
+        ("Initial_Punctuation", "Pi"), ("Final_Punctuation", "Pf"), ("Other_Punctuation", "Po"),
+        ("Symbol", "S"), ("Math_Symbol", "Sm"), ("Currency_Symbol", "Sc"),
+        ("Modifier_Symbol", "Sk"), ("Other_Symbol", "So"),
+        ("Separator", "Z"), ("Space_Separator", "Zs"), ("Line_Separator", "Zl"),
+        ("Paragraph_Separator", "Zp"), ("Other", "C"), ("Control", "Cc"), ("Format", "Cf"),
+        ("Surrogate", "Cs"), ("Private_Use", "Co"), ("Unassigned", "Cn"),
+    ];
+    if !p.contains("\\p{") && !p.contains("\\P{") {
+        return p.to_string();
+    }
+    let chars: Vec<char> = p.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if i + 3 < chars.len()
+            && chars[i] == '\\'
+            && (chars[i + 1] == 'p' || chars[i + 1] == 'P')
+            && chars[i + 2] == '{'
+        {
+            if let Some(close_rel) = chars[i + 3..].iter().position(|&c| c == '}') {
+                let close = i + 3 + close_rel;
+                let name: String = chars[i + 3..close].iter().collect();
+                if let Some((_, short)) = MAP.iter().find(|(long, _)| *long == name) {
+                    out.push(chars[i]);
+                    out.push(chars[i + 1]);
+                    out.push('{');
+                    out.push_str(short);
+                    out.push('}');
+                    i = close + 1;
+                    continue;
+                }
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
 }
 
 // ── Name sanitization ───────────────────────────────────────────────────────
@@ -167,9 +332,12 @@ fn emit_definition(name: &str, ir: &SchemaIr, defs: &[DefEntry], prefix: &str, c
                 || obj.property_names.is_some()
                 || obj.min_properties.is_some()
                 || obj.max_properties.is_some()
-                || !obj.dependent_schemas.is_empty();
+                || !obj.dependent_schemas.is_empty()
+                || !obj.dependent_required.is_empty()
+                || obj.fields.values().any(|f| !field_fully_typed(&f.schema))
+                || obj.fields.iter().any(|(_, f)| !f.required);
             if needs_custom {
-                emit_wrapper(name, ir, defs, counter)
+                emit_wrapper(name, ir, defs, prefix, counter)
             } else {
                 emit_data_class(name, obj, defs, prefix)
             }
@@ -184,14 +352,49 @@ fn emit_definition(name: &str, ir: &SchemaIr, defs: &[DefEntry], prefix: &str, c
             if matches!(inner.as_ref(), SchemaIr::Object(_)) {
                 emit_definition(name, inner, defs, prefix, counter)
             } else {
-                emit_wrapper(name, ir, defs, counter)
+                emit_wrapper(name, ir, defs, prefix, counter)
             }
         }
         SchemaIr::Ref(ref_name) => {
             let safe = sanitize_kotlin_name(ref_name, prefix);
             format!("typealias {name} = {safe}")
         }
-        _ => emit_wrapper(name, ir, defs, counter),
+        _ => emit_wrapper(name, ir, defs, prefix, counter),
+    }
+}
+
+/// True when the Kotlin type produced by `kotlin_type` fully enforces this
+/// schema on its own (so a plain `@Serializable data class` field suffices).
+/// Anything with value constraints, inline enums/literals, nested inline
+/// objects, tuples, unions etc. needs the wrapper-serializer path instead.
+fn field_fully_typed(ir: &SchemaIr) -> bool {
+    match ir {
+        SchemaIr::Any | SchemaIr::Unknown | SchemaIr::Boolean => true,
+        SchemaIr::String(c) => {
+            c.min_length.is_none() && c.max_length.is_none() && c.pattern.is_none()
+        }
+        SchemaIr::Ref(_) | SchemaIr::Lazy(_) => true,
+        SchemaIr::Array(arr) => {
+            arr.min_items.is_none()
+                && arr.max_items.is_none()
+                && !arr.unique_items
+                && arr.contains.is_none()
+                && field_fully_typed(&arr.items)
+        }
+        SchemaIr::Optional(inner)
+        | SchemaIr::Nullable(inner)
+        | SchemaIr::Describe(inner, _)
+        | SchemaIr::Default(inner, _) => field_fully_typed(inner),
+        // Int/Double fields reject 1.0-style integers or big values oddly, and
+        // constrained numbers lose their bounds — keep only if unconstrained.
+        SchemaIr::Integer(c) | SchemaIr::Number(c) => {
+            c.minimum.is_none()
+                && c.maximum.is_none()
+                && c.exclusive_minimum.is_none()
+                && c.exclusive_maximum.is_none()
+                && c.multiple_of.is_none()
+        }
+        _ => false,
     }
 }
 
@@ -277,14 +480,14 @@ fn emit_enum_class(name: &str, cases: &[String]) -> String {
 
 // ── Wrapper class with custom serializer ────────────────────────────────────
 
-fn emit_wrapper(name: &str, ir: &SchemaIr, defs: &[DefEntry], counter: &mut usize) -> String {
+fn emit_wrapper(name: &str, ir: &SchemaIr, defs: &[DefEntry], prefix: &str, counter: &mut usize) -> String {
     let inner = unwrap_modifiers(ir);
     let is_nullable = matches!(ir, SchemaIr::Nullable(_));
 
     *counter += 1;
     let ser_name = format!("{name}Ser");
 
-    let validation = emit_validation(inner, defs, counter);
+    let validation = emit_validation(inner, defs, prefix, counter);
 
     let mut out = String::new();
 
@@ -334,8 +537,49 @@ fn unwrap_modifiers(ir: &SchemaIr) -> &SchemaIr {
 
 // ── Validation code generation ──────────────────────────────────────────────
 
-fn emit_validation(ir: &SchemaIr, defs: &[DefEntry], counter: &mut usize) -> String {
+fn emit_validation(ir: &SchemaIr, defs: &[DefEntry], prefix: &str, counter: &mut usize) -> String {
     match ir {
+        SchemaIr::Interpreted { schema, remotes } => {
+            let schema_json =
+                serde_json::to_string(schema).unwrap_or_else(|_| "true".to_string());
+            let remotes_json = {
+                let map: serde_json::Map<String, serde_json::Value> = remotes
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                serde_json::to_string(&serde_json::Value::Object(map))
+                    .unwrap_or_else(|_| "{}".to_string())
+            };
+            format!(
+                "        val _s = kotlinx.serialization.json.Json.parseToJsonElement(\"{}\")\n        val _r = kotlinx.serialization.json.Json.parseToJsonElement(\"{}\") as JsonObject\n        require(_jsiValidate(_s, _r, el)) {{ \"does not match schema\" }}\n",
+                escape_string(&schema_json),
+                escape_string(&remotes_json)
+            )
+        }
+        SchemaIr::Describe(inner, _) | SchemaIr::Default(inner, _) | SchemaIr::Optional(inner) => {
+            emit_validation(inner, defs, prefix, counter)
+        }
+        SchemaIr::Nullable(inner) => {
+            let v = emit_validation(inner, defs, prefix, counter);
+            if v.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "        if (el !is JsonNull) {{\n    {}\n        }}\n",
+                    v.trim_end().replace('\n', "\n    ")
+                )
+            }
+        }
+        SchemaIr::Enum(cases) => {
+            let allowed: Vec<String> = cases
+                .iter()
+                .map(|c| format!("\"{}\"", escape_string(c)))
+                .collect();
+            format!(
+                "        require(el is JsonPrimitive && el.isString && el.content in setOf<String>({})) {{ \"must be one of the allowed values\" }}\n",
+                allowed.join(", ")
+            )
+        }
         SchemaIr::Integer(c) => {
             let mut checks = Vec::new();
             checks.push(
@@ -363,7 +607,7 @@ fn emit_validation(ir: &SchemaIr, defs: &[DefEntry], counter: &mut usize) -> Str
             checks.join("\n") + "\n"
         }
         SchemaIr::Boolean => {
-            "        require(el is JsonPrimitive && el.booleanOrNull != null) { \"must be a boolean\" }\n"
+            "        require(el is JsonPrimitive && !el.isString && el.booleanOrNull != null) { \"must be a boolean\" }\n"
                 .to_string()
         }
         SchemaIr::String(c) => {
@@ -374,15 +618,15 @@ fn emit_validation(ir: &SchemaIr, defs: &[DefEntry], counter: &mut usize) -> Str
             );
             checks.push("        val v = el.content".to_string());
             if let Some(min) = c.min_length {
-                checks.push(format!("        require(v.length >= {min}) {{ \"minLength\" }}"));
+                checks.push(format!("        require(v.codePointCount(0, v.length) >= {min}) {{ \"minLength\" }}"));
             }
             if let Some(max) = c.max_length {
-                checks.push(format!("        require(v.length <= {max}) {{ \"maxLength\" }}"));
+                checks.push(format!("        require(v.codePointCount(0, v.length) <= {max}) {{ \"maxLength\" }}"));
             }
             if let Some(ref pat) = c.pattern {
                 checks.push(format!(
                     "        require(Regex(\"{}\").containsMatchIn(v)) {{ \"pattern\" }}",
-                    escape_string(pat)
+                    escape_string(&translate_pattern(pat))
                 ));
             }
             checks.join("\n") + "\n"
@@ -399,7 +643,7 @@ fn emit_validation(ir: &SchemaIr, defs: &[DefEntry], counter: &mut usize) -> Str
             let json_str = serde_json::to_string(val).unwrap_or_else(|_| "null".to_string());
             let escaped = escape_string(&json_str);
             format!(
-                "        val expected = kotlinx.serialization.json.Json.parseToJsonElement(\"{}\")\n        require(el == expected) {{ \"must equal const value\" }}\n",
+                "        val expected = kotlinx.serialization.json.Json.parseToJsonElement(\"{}\")\n        require(_jsiEq(el, expected)) {{ \"must equal const value\" }}\n",
                 escaped
             )
         }
@@ -414,34 +658,34 @@ fn emit_validation(ir: &SchemaIr, defs: &[DefEntry], counter: &mut usize) -> Str
             let json_str = serde_json::to_string(vals).unwrap_or_else(|_| "[]".to_string());
             let escaped = escape_string(&json_str);
             format!(
-                "        val allowed = kotlinx.serialization.json.Json.parseToJsonElement(\"{escaped}\") as JsonArray\n        require(el in allowed) {{ \"must be one of the allowed values\" }}\n"
+                "        val allowed = kotlinx.serialization.json.Json.parseToJsonElement(\"{escaped}\") as JsonArray\n        require(allowed.any {{ _jsiEq(el, it) }}) {{ \"must be one of the allowed values\" }}\n"
             )
         }
-        SchemaIr::Array(arr) => emit_array_validation(arr, defs, counter),
-        SchemaIr::Tuple(tuple) => emit_tuple_validation(tuple, defs, counter),
-        SchemaIr::TypeGuarded(guards) => emit_type_guarded_validation(guards, defs, counter),
+        SchemaIr::Array(arr) => emit_array_validation(arr, defs, prefix, counter),
+        SchemaIr::Tuple(tuple) => emit_tuple_validation(tuple, defs, prefix, counter),
+        SchemaIr::TypeGuarded(guards) => emit_type_guarded_validation(guards, defs, prefix, counter),
         SchemaIr::Not { base: _, not_schema } => {
-            let not_check = emit_not_check(not_schema, defs, counter);
+            let not_check = emit_not_check(not_schema, defs, prefix, counter);
             format!("{not_check}")
         }
         SchemaIr::Conditional { base: _, if_schema, then_schema, else_schema } => {
-            emit_conditional_check(if_schema, then_schema.as_deref(), else_schema.as_deref(), defs, counter)
+            emit_conditional_check(if_schema, then_schema.as_deref(), else_schema.as_deref(), defs, prefix, counter)
         }
         SchemaIr::Union(members) if members.len() > 1 => {
-            emit_union_check(members, defs, counter, false)
+            emit_union_check(members, defs, prefix, counter, false)
         }
         SchemaIr::ExclusiveUnion(members) if members.len() > 1 => {
-            emit_union_check(members, defs, counter, true)
+            emit_union_check(members, defs, prefix, counter, true)
         }
         SchemaIr::Intersection(members) if members.len() == 1 => {
-            emit_validation(&members[0], defs, counter)
+            emit_validation(&members[0], defs, prefix, counter)
         }
         SchemaIr::Intersection(members) if members.len() > 1 => {
             // Wrap each member in `run { }` so local vals (v, obj, arr, known…)
             // declared by one member's checks don't conflict with the next.
             let mut checks = String::new();
             for member in members {
-                let v = emit_validation(member, defs, counter);
+                let v = emit_validation(member, defs, prefix, counter);
                 if v.is_empty() {
                     continue;
                 }
@@ -454,7 +698,7 @@ fn emit_validation(ir: &SchemaIr, defs: &[DefEntry], counter: &mut usize) -> Str
             checks.push_str("        require(el is JsonObject) { \"must be an object\" }\n");
             if !matches!(rec.value.as_ref(), SchemaIr::Any | SchemaIr::Unknown) {
                 // Validate each value
-                let val_check = emit_inline_check(&rec.value, "v", defs);
+                let val_check = emit_inline_check(&rec.value, "v", defs, prefix);
                 if !val_check.is_empty() {
                     checks.push_str(&format!(
                         "        for ((_, v) in el.jsonObject) {{ {} }}\n",
@@ -475,7 +719,7 @@ fn emit_validation(ir: &SchemaIr, defs: &[DefEntry], counter: &mut usize) -> Str
                         escape_string(k), escape_string(k)
                     ));
                 }
-                let field_check = emit_inline_check(&f.schema, &format!("obj[\"{}\"]!!", escape_string(k)), defs);
+                let field_check = emit_inline_check(&f.schema, &format!("obj[\"{}\"]!!", escape_string(k)), defs, prefix);
                 if !field_check.is_empty() && !matches!(&f.schema, SchemaIr::Any | SchemaIr::Unknown) {
                     checks.push(format!(
                         "        if (\"{}\" in obj) {{ {} }}",
@@ -495,23 +739,23 @@ fn emit_validation(ir: &SchemaIr, defs: &[DefEntry], counter: &mut usize) -> Str
                 checks.push("        for ((k, v) in obj) {".to_string());
                 checks.push(format!("            var matched = setOf<String>({}).contains(k)", known.join(", ")));
                 for (pattern, pp_schema) in &obj.pattern_properties {
-                    let pp_check = emit_inline_check(pp_schema, "v", defs);
+                    let pp_check = emit_inline_check(pp_schema, "v", defs, prefix);
                     if !pp_check.is_empty() {
                         checks.push(format!(
                             "            if (Regex(\"{}\").containsMatchIn(k)) {{ matched = true; {} }}",
-                            escape_string(pattern), pp_check
+                            escape_string(&translate_pattern(pattern)), pp_check
                         ));
                     } else {
                         checks.push(format!(
                             "            if (Regex(\"{}\").containsMatchIn(k)) {{ matched = true }}",
-                            escape_string(pattern)
+                            escape_string(&translate_pattern(pattern))
                         ));
                     }
                 }
                 if matches!(obj.additional_properties, AdditionalProperties::Forbidden) {
                     checks.push("            require(matched) { \"unexpected property: $k\" }".to_string());
                 } else if let AdditionalProperties::Schema(ap) = &obj.additional_properties {
-                    let ap_check = emit_inline_check(ap, "v", defs);
+                    let ap_check = emit_inline_check(ap, "v", defs, prefix);
                     if !ap_check.is_empty() {
                         checks.push(format!("            if (!matched) {{ {} }}", ap_check));
                     }
@@ -526,7 +770,7 @@ fn emit_validation(ir: &SchemaIr, defs: &[DefEntry], counter: &mut usize) -> Str
                 checks.push("        for (k in obj.keys) { require(k in known) { \"unexpected property: $k\" } }".to_string());
             } else if let AdditionalProperties::Schema(ap) = &obj.additional_properties {
                 let known: Vec<String> = obj.fields.keys().map(|k| format!("\"{}\"", escape_string(k))).collect();
-                let ap_check = emit_inline_check(ap, "v", defs);
+                let ap_check = emit_inline_check(ap, "v", defs, prefix);
                 if !ap_check.is_empty() {
                     checks.push(format!(
                         "        val _known = setOf<String>({})\n        for ((k, v) in obj) {{ if (k !in _known) {{ {} }} }}",
@@ -536,7 +780,7 @@ fn emit_validation(ir: &SchemaIr, defs: &[DefEntry], counter: &mut usize) -> Str
             }
             // propertyNames
             if let Some(pn) = &obj.property_names {
-                emit_property_names_checks(pn, &mut checks, "        ");
+                emit_property_names_checks(pn, &mut checks, "        ", defs, prefix);
             }
             // dependentRequired
             for (prop, required) in &obj.dependent_required {
@@ -549,7 +793,7 @@ fn emit_validation(ir: &SchemaIr, defs: &[DefEntry], counter: &mut usize) -> Str
             }
             // dependentSchemas
             for (prop, dep_schema) in &obj.dependent_schemas {
-                let dep_check = emit_match_expression(dep_schema, "el", defs);
+                let dep_check = emit_match_expression(dep_schema, "el", defs, prefix);
                 if dep_check != "true" {
                     checks.push(format!(
                         "        if (\"{}\" in obj) {{ require({}) {{ \"dependentSchemas\" }} }}",
@@ -567,7 +811,12 @@ fn emit_validation(ir: &SchemaIr, defs: &[DefEntry], counter: &mut usize) -> Str
                 checks.join("\n") + "\n"
             }
         }
-        SchemaIr::Ref(_) | SchemaIr::Lazy(_) => String::new(), // handled by typealias
+        SchemaIr::Ref(name) | SchemaIr::Lazy(name) => {
+            // Delegate to the referenced type's serializer, which performs the
+            // full validation for that definition (data class, enum or wrapper).
+            let safe = sanitize_kotlin_name(name, prefix);
+            format!("        _lenientJson.decodeFromJsonElement<{safe}>(el)\n")
+        }
         _ => String::new(),
     }
 }
@@ -592,7 +841,7 @@ fn emit_number_checks(checks: &mut Vec<String>, c: &NumberConstraints, var_name:
     if let Some(mul) = c.multiple_of {
         let b = format_kt_number(mul);
         checks.push(format!(
-            "        require({var_name}.toDouble().rem({b}).let {{ kotlin.math.abs(it) < 1e-9 || kotlin.math.abs(kotlin.math.abs(it) - {b}) < 1e-9 }}) {{ \"multipleOf\" }}"
+            "        require(({var_name}.toDouble() / {b}).let {{ it.isFinite() && it == kotlin.math.floor(it) }}) {{ \"multipleOf\" }}"
         ));
     }
 }
@@ -600,16 +849,16 @@ fn emit_number_checks(checks: &mut Vec<String>, c: &NumberConstraints, var_name:
 fn emit_literal_check(lit: &LiteralValue) -> String {
     match lit {
         LiteralValue::Bool(b) => format!(
-            "        require(el is JsonPrimitive && el.booleanOrNull == {}) {{ \"must be {}\" }}\n",
+            "        require(el is JsonPrimitive && !el.isString && el.booleanOrNull == {}) {{ \"must be {}\" }}\n",
             b, b
         ),
         LiteralValue::Integer(i) => format!(
-            "        require(el is JsonPrimitive && el.booleanOrNull == null && (el.longOrNull == {i}L || el.doubleOrNull == {i}.0)) {{ \"must be {i}\" }}\n"
+            "        require(el is JsonPrimitive && !el.isString && el.booleanOrNull == null && (el.longOrNull == {i}L || el.doubleOrNull == {i}.0)) {{ \"must be {i}\" }}\n"
         ),
         LiteralValue::Number(n) => {
             let b = format_kt_number(*n);
             format!(
-                "        require(el is JsonPrimitive && el.booleanOrNull == null && el.doubleOrNull == {b}) {{ \"must be {b}\" }}\n"
+                "        require(el is JsonPrimitive && !el.isString && el.booleanOrNull == null && el.doubleOrNull == {b}) {{ \"must be {b}\" }}\n"
             )
         }
         LiteralValue::String(s) => {
@@ -626,13 +875,13 @@ fn emit_literal_check(lit: &LiteralValue) -> String {
 
 fn emit_literal_match(lit: &LiteralValue) -> String {
     match lit {
-        LiteralValue::Bool(b) => format!("(el is JsonPrimitive && el.booleanOrNull == {b})"),
+        LiteralValue::Bool(b) => format!("(el is JsonPrimitive && !el.isString && el.booleanOrNull == {b})"),
         LiteralValue::Integer(i) => format!(
-            "(el is JsonPrimitive && el.booleanOrNull == null && (el.longOrNull == {i}L || el.doubleOrNull == {i}.0))"
+            "(el is JsonPrimitive && !el.isString && el.booleanOrNull == null && (el.longOrNull == {i}L || el.doubleOrNull == {i}.0))"
         ),
         LiteralValue::Number(n) => {
             let b = format_kt_number(*n);
-            format!("(el is JsonPrimitive && el.booleanOrNull == null && el.doubleOrNull == {b})")
+            format!("(el is JsonPrimitive && !el.isString && el.booleanOrNull == null && el.doubleOrNull == {b})")
         }
         LiteralValue::String(s) => {
             let escaped = escape_string(s);
@@ -642,7 +891,7 @@ fn emit_literal_match(lit: &LiteralValue) -> String {
     }
 }
 
-fn emit_inline_check(ir: &SchemaIr, var_name: &str, defs: &[DefEntry]) -> String {
+fn emit_inline_check(ir: &SchemaIr, var_name: &str, defs: &[DefEntry], prefix: &str) -> String {
     match ir {
         SchemaIr::Integer(c) if c.minimum.is_none() && c.maximum.is_none() && c.exclusive_minimum.is_none() && c.exclusive_maximum.is_none() && c.multiple_of.is_none() => {
             format!("require({var_name} is JsonPrimitive && !{var_name}.jsonPrimitive.isString && {var_name}.jsonPrimitive.booleanOrNull == null && ({var_name}.jsonPrimitive.longOrNull != null || {var_name}.jsonPrimitive.doubleOrNull?.let {{ it == it.toLong().toDouble() }} == true))")
@@ -650,7 +899,7 @@ fn emit_inline_check(ir: &SchemaIr, var_name: &str, defs: &[DefEntry]) -> String
         SchemaIr::Number(c) if c.minimum.is_none() && c.maximum.is_none() && c.exclusive_minimum.is_none() && c.exclusive_maximum.is_none() && c.multiple_of.is_none() => {
             format!("require({var_name} is JsonPrimitive && !{var_name}.jsonPrimitive.isString && {var_name}.jsonPrimitive.booleanOrNull == null && {var_name}.jsonPrimitive.doubleOrNull != null)")
         }
-        SchemaIr::Boolean => format!("require({var_name} is JsonPrimitive && {var_name}.jsonPrimitive.booleanOrNull != null)"),
+        SchemaIr::Boolean => format!("require({var_name} is JsonPrimitive && !{var_name}.jsonPrimitive.isString && {var_name}.jsonPrimitive.booleanOrNull != null)"),
         SchemaIr::String(c) if c.min_length.is_none() && c.max_length.is_none() && c.pattern.is_none() => {
             format!("require({var_name} is JsonPrimitive && {var_name}.jsonPrimitive.isString)")
         }
@@ -660,7 +909,7 @@ fn emit_inline_check(ir: &SchemaIr, var_name: &str, defs: &[DefEntry]) -> String
         _ => {
             // For complex schemas, use full validation via el rebinding
             let mut counter = 0usize;
-            let validation = emit_validation(ir, defs, &mut counter);
+            let validation = emit_validation(ir, defs, prefix, &mut counter);
             if validation.is_empty() {
                 return String::new();
             }
@@ -670,9 +919,9 @@ fn emit_inline_check(ir: &SchemaIr, var_name: &str, defs: &[DefEntry]) -> String
 }
 
 /// Generate a try/catch expression that returns true if `var_name` matches `ir`.
-fn emit_match_expression(ir: &SchemaIr, var_name: &str, defs: &[DefEntry]) -> String {
+fn emit_match_expression(ir: &SchemaIr, var_name: &str, defs: &[DefEntry], prefix: &str) -> String {
     let mut counter = 0usize;
-    let validation = emit_validation(ir, defs, &mut counter);
+    let validation = emit_validation(ir, defs, prefix, &mut counter);
     if validation.is_empty() {
         return "true".to_string();
     }
@@ -682,7 +931,7 @@ fn emit_match_expression(ir: &SchemaIr, var_name: &str, defs: &[DefEntry]) -> St
     )
 }
 
-fn emit_array_validation(arr: &ArraySchema, defs: &[DefEntry], _counter: &mut usize) -> String {
+fn emit_array_validation(arr: &ArraySchema, defs: &[DefEntry], prefix: &str, _counter: &mut usize) -> String {
     let mut checks = Vec::new();
     checks.push("        require(el is JsonArray) { \"must be an array\" }".to_string());
     checks.push("        val arr = el.jsonArray".to_string());
@@ -696,7 +945,7 @@ fn emit_array_validation(arr: &ArraySchema, defs: &[DefEntry], _counter: &mut us
 
     // Item type validation
     if !matches!(arr.items.as_ref(), SchemaIr::Any) {
-        let item_check = emit_inline_check(&arr.items, "item", defs);
+        let item_check = emit_inline_check(&arr.items, "item", defs, prefix);
         if !item_check.is_empty() {
             checks.push(format!("        for (item in arr) {{ {item_check} }}"));
         }
@@ -710,7 +959,7 @@ fn emit_array_validation(arr: &ArraySchema, defs: &[DefEntry], _counter: &mut us
     }
 
     if let Some(contains) = &arr.contains {
-        let contains_check = emit_inline_check(&contains.schema, "it", defs);
+        let contains_check = emit_inline_check(&contains.schema, "it", defs, prefix);
         let min = contains.min_contains.unwrap_or(1);
         if !contains_check.is_empty() {
             checks.push(format!(
@@ -733,7 +982,7 @@ fn emit_array_validation(arr: &ArraySchema, defs: &[DefEntry], _counter: &mut us
     checks.join("\n") + "\n"
 }
 
-fn emit_tuple_validation(tuple: &TupleSchema, defs: &[DefEntry], _counter: &mut usize) -> String {
+fn emit_tuple_validation(tuple: &TupleSchema, defs: &[DefEntry], prefix: &str, _counter: &mut usize) -> String {
     let mut checks = Vec::new();
     checks.push("        require(el is JsonArray) { \"must be an array\" }".to_string());
     checks.push("        val arr = el.jsonArray".to_string());
@@ -743,7 +992,7 @@ fn emit_tuple_validation(tuple: &TupleSchema, defs: &[DefEntry], _counter: &mut 
         if matches!(item, SchemaIr::Any) {
             continue;
         }
-        let item_check = emit_inline_check(item, &format!("arr[{i}]"), defs);
+        let item_check = emit_inline_check(item, &format!("arr[{i}]"), defs, prefix);
         if !item_check.is_empty() {
             checks.push(format!("        if (arr.size > {i}) {{ {item_check} }}"));
         }
@@ -752,7 +1001,7 @@ fn emit_tuple_validation(tuple: &TupleSchema, defs: &[DefEntry], _counter: &mut 
     let prefix_count = tuple.items.len();
     if let Some(rest) = &tuple.rest {
         if !matches!(rest.as_ref(), SchemaIr::Any) {
-            let rest_check = emit_inline_check(rest, "arr[i]", defs);
+            let rest_check = emit_inline_check(rest, "arr[i]", defs, prefix);
             if !rest_check.is_empty() {
                 checks.push(format!("        for (i in {prefix_count} until arr.size) {{ {rest_check} }}"));
             }
@@ -783,6 +1032,7 @@ fn emit_tuple_validation(tuple: &TupleSchema, defs: &[DefEntry], _counter: &mut 
 fn emit_type_guarded_validation(
     guards: &[(TypeGuard, Box<SchemaIr>)],
     defs: &[DefEntry],
+    prefix: &str,
     _counter: &mut usize,
 ) -> String {
     let mut checks = Vec::new();
@@ -794,15 +1044,15 @@ fn emit_type_guarded_validation(
                     checks.push("        if (el is JsonPrimitive && el.isString) {".to_string());
                     checks.push("            val v = el.content".to_string());
                     if let Some(min) = c.min_length {
-                        checks.push(format!("            require(v.length >= {min}) {{ \"minLength\" }}"));
+                        checks.push(format!("            require(v.codePointCount(0, v.length) >= {min}) {{ \"minLength\" }}"));
                     }
                     if let Some(max) = c.max_length {
-                        checks.push(format!("            require(v.length <= {max}) {{ \"maxLength\" }}"));
+                        checks.push(format!("            require(v.codePointCount(0, v.length) <= {max}) {{ \"maxLength\" }}"));
                     }
                     if let Some(ref pat) = c.pattern {
                         checks.push(format!(
                             "            require(Regex(\"{}\").containsMatchIn(v)) {{ \"pattern\" }}",
-                            escape_string(pat)
+                            escape_string(&translate_pattern(pat))
                         ));
                     }
                     checks.push("        }".to_string());
@@ -834,7 +1084,7 @@ fn emit_type_guarded_validation(
                 if let Some(mul) = c.multiple_of {
                     let b = format_kt_number(mul);
                     checks.push(format!(
-                        "            require(v.rem({b}).let {{ kotlin.math.abs(it) < 1e-9 || kotlin.math.abs(kotlin.math.abs(it) - {b}) < 1e-9 }}) {{ \"multipleOf\" }}"
+                        "            require((v / {b}).let {{ it.isFinite() && it == kotlin.math.floor(it) }}) {{ \"multipleOf\" }}"
                     ));
                 }
                 checks.push("        }".to_string());
@@ -851,7 +1101,7 @@ fn emit_type_guarded_validation(
                             ));
                         }
                         // Field type validation
-                        let field_check = emit_inline_check(&f.schema, &format!("obj[\"{}\"]!!", escape_string(k)), defs);
+                        let field_check = emit_inline_check(&f.schema, &format!("obj[\"{}\"]!!", escape_string(k)), defs, prefix);
                         if !field_check.is_empty() && !matches!(&f.schema, SchemaIr::Any | SchemaIr::Unknown) {
                             checks.push(format!(
                                 "            if (\"{}\" in obj) {{ {} }}",
@@ -865,17 +1115,56 @@ fn emit_type_guarded_validation(
                     if let Some(max) = obj.max_properties {
                         checks.push(format!("            require(obj.size <= {max}) {{ \"maxProperties\" }}"));
                     }
-                    if matches!(obj.additional_properties, AdditionalProperties::Forbidden) {
+                    // patternProperties + additionalProperties interaction:
+                    // additionalProperties applies only to keys not matched by
+                    // a named property or any patternProperties regex.
+                    if !obj.pattern_properties.is_empty() {
+                        let known: Vec<String> = obj.fields.keys().map(|k| format!("\"{}\"", escape_string(k))).collect();
+                        checks.push("            for ((k, v) in obj) {".to_string());
+                        checks.push(format!("                var matched = setOf<String>({}).contains(k)", known.join(", ")));
+                        for (pattern, pp_schema) in &obj.pattern_properties {
+                            let pp_check = emit_inline_check(pp_schema, "v", defs, prefix);
+                            if !pp_check.is_empty() {
+                                checks.push(format!(
+                                    "                if (Regex(\"{}\").containsMatchIn(k)) {{ matched = true; {} }}",
+                                    escape_string(&translate_pattern(pattern)), pp_check
+                                ));
+                            } else {
+                                checks.push(format!(
+                                    "                if (Regex(\"{}\").containsMatchIn(k)) {{ matched = true }}",
+                                    escape_string(&translate_pattern(pattern))
+                                ));
+                            }
+                        }
+                        if matches!(obj.additional_properties, AdditionalProperties::Forbidden) {
+                            checks.push("                require(matched) { \"unexpected property: $k\" }".to_string());
+                        } else if let AdditionalProperties::Schema(ap) = &obj.additional_properties {
+                            let ap_check = emit_inline_check(ap, "v", defs, prefix);
+                            if !ap_check.is_empty() {
+                                checks.push(format!("                if (!matched) {{ {} }}", ap_check));
+                            }
+                        }
+                        checks.push("            }".to_string());
+                    } else if matches!(obj.additional_properties, AdditionalProperties::Forbidden) {
                         let known: Vec<String> = obj.fields.keys().map(|k| format!("\"{}\"", escape_string(k))).collect();
                         checks.push(format!(
                             "            val known = setOf<String>({})",
                             known.join(", ")
                         ));
                         checks.push("            for (k in obj.keys) { require(k in known) { \"unexpected property: $k\" } }".to_string());
+                    } else if let AdditionalProperties::Schema(ap) = &obj.additional_properties {
+                        let known: Vec<String> = obj.fields.keys().map(|k| format!("\"{}\"", escape_string(k))).collect();
+                        let ap_check = emit_inline_check(ap, "v", defs, prefix);
+                        if !ap_check.is_empty() {
+                            checks.push(format!(
+                                "            val _known = setOf<String>({})\n            for ((k, v) in obj) {{ if (k !in _known) {{ {} }} }}",
+                                known.join(", "), ap_check
+                            ));
+                        }
                     }
                     // propertyNames
                     if let Some(pn) = &obj.property_names {
-                        emit_property_names_checks(pn, &mut checks, "            ");
+                        emit_property_names_checks(pn, &mut checks, "            ", defs, prefix);
                     }
                     // dependentRequired
                     for (prop, required) in &obj.dependent_required {
@@ -888,7 +1177,7 @@ fn emit_type_guarded_validation(
                     }
                     // dependentSchemas
                     for (prop, dep_schema) in &obj.dependent_schemas {
-                        let dep_check = emit_match_expression(dep_schema, "el", defs);
+                        let dep_check = emit_match_expression(dep_schema, "el", defs, prefix);
                         if dep_check != "true" {
                             checks.push(format!(
                                 "            if (\"{}\" in obj) {{ require({}) {{ \"dependentSchemas\" }} }}",
@@ -896,32 +1185,11 @@ fn emit_type_guarded_validation(
                             ));
                         }
                     }
-                    // additionalProperties with schema
-                    if let AdditionalProperties::Schema(ap) = &obj.additional_properties {
-                        let known: Vec<String> = obj.fields.keys().map(|k| format!("\"{}\"", escape_string(k))).collect();
-                        let ap_check = emit_inline_check(ap, "v", defs);
-                        if !ap_check.is_empty() {
-                            checks.push(format!(
-                                "            val _known = setOf<String>({})\n            for ((k, v) in obj) {{ if (k !in _known) {{ {} }} }}",
-                                known.join(", "), ap_check
-                            ));
-                        }
-                    }
-                    // patternProperties in TypeGuard::Object
-                    for (pattern, pp_schema) in &obj.pattern_properties {
-                        let pp_check = emit_inline_check(pp_schema, "v", defs);
-                        if !pp_check.is_empty() {
-                            checks.push(format!(
-                                "            for ((k, v) in obj) {{ if (Regex(\"{}\").containsMatchIn(k)) {{ {} }} }}",
-                                escape_string(pattern), pp_check
-                            ));
-                        }
-                    }
                     checks.push("        }".to_string());
                 }
                 // Record in TypeGuard::Object
                 if let SchemaIr::Record(rec) = schema.as_ref() {
-                    let val_check = emit_inline_check(&rec.value, "v", defs);
+                    let val_check = emit_inline_check(&rec.value, "v", defs, prefix);
                     if !val_check.is_empty() {
                         checks.push("        if (el is JsonObject) {".to_string());
                         checks.push(format!("            for ((_, v) in el.jsonObject) {{ {} }}", val_check));
@@ -940,7 +1208,7 @@ fn emit_type_guarded_validation(
                         checks.push(format!("            require(arr.size <= {max}) {{ \"maxItems\" }}"));
                     }
                     if !matches!(arr.items.as_ref(), SchemaIr::Any) {
-                        let item_check = emit_inline_check(&arr.items, "item", defs);
+                        let item_check = emit_inline_check(&arr.items, "item", defs, prefix);
                         if !item_check.is_empty() {
                             checks.push(format!("            for (item in arr) {{ {item_check} }}"));
                         }
@@ -953,7 +1221,7 @@ fn emit_type_guarded_validation(
                     }
                     // contains in TypeGuard::Array
                     if let Some(contains) = &arr.contains {
-                        let match_expr = emit_match_expression(&contains.schema, "it", defs);
+                        let match_expr = emit_match_expression(&contains.schema, "it", defs, prefix);
                         let min = contains.min_contains.unwrap_or(1);
                         checks.push(format!(
                             "            val matchCount = arr.count {{ {match_expr} }}"
@@ -975,7 +1243,7 @@ fn emit_type_guarded_validation(
                     checks.push("            val arr = el.jsonArray".to_string());
                     for (i, item) in tuple.items.iter().enumerate() {
                         if matches!(item, SchemaIr::Any) { continue; }
-                        let item_check = emit_inline_check(item, &format!("arr[{i}]"), defs);
+                        let item_check = emit_inline_check(item, &format!("arr[{i}]"), defs, prefix);
                         if !item_check.is_empty() {
                             checks.push(format!("            if (arr.size > {i}) {{ {item_check} }}"));
                         }
@@ -983,7 +1251,7 @@ fn emit_type_guarded_validation(
                     let prefix_count = tuple.items.len();
                     if let Some(rest) = &tuple.rest {
                         if !matches!(rest.as_ref(), SchemaIr::Any) {
-                            let rest_check = emit_inline_check(rest, "arr[i]", defs);
+                            let rest_check = emit_inline_check(rest, "arr[i]", defs, prefix);
                             if !rest_check.is_empty() {
                                 checks.push(format!("            for (i in {prefix_count} until arr.size) {{ {rest_check} }}"));
                             }
@@ -1018,43 +1286,18 @@ fn emit_type_guarded_validation(
     }
 }
 
-fn emit_property_names_checks(pn: &SchemaIr, checks: &mut Vec<String>, indent: &str) {
-    match pn {
-        SchemaIr::Never => {
-            checks.push(format!("{indent}require(obj.isEmpty()) {{ \"propertyNames: no properties allowed\" }}"));
-        }
-        SchemaIr::String(c) => {
-            if let Some(max) = c.max_length {
-                checks.push(format!("{indent}for (k in obj.keys) {{ require(k.length <= {max}) {{ \"propertyNames\" }} }}"));
-            }
-            if let Some(min) = c.min_length {
-                checks.push(format!("{indent}for (k in obj.keys) {{ require(k.length >= {min}) {{ \"propertyNames\" }} }}"));
-            }
-            if let Some(ref pat) = c.pattern {
-                checks.push(format!(
-                    "{indent}for (k in obj.keys) {{ require(Regex(\"{}\").containsMatchIn(k)) {{ \"propertyNames\" }} }}",
-                    escape_string(pat)
-                ));
-            }
-        }
-        SchemaIr::Literal(LiteralValue::String(s)) => {
-            let escaped = escape_string(s);
-            checks.push(format!("{indent}for (k in obj.keys) {{ require(k == \"{escaped}\") {{ \"propertyNames\" }} }}"));
-        }
-        SchemaIr::Enum(cases) => {
-            let allowed: Vec<String> = cases.iter().map(|c| format!("\"{}\"", escape_string(c))).collect();
-            checks.push(format!("{indent}val _pnAllowed = setOf<String>({})", allowed.join(", ")));
-            checks.push(format!("{indent}for (k in obj.keys) {{ require(k in _pnAllowed) {{ \"propertyNames\" }} }}"));
-        }
-        SchemaIr::Describe(inner, _) | SchemaIr::Default(inner, _) | SchemaIr::Nullable(inner) => {
-            emit_property_names_checks(inner, checks, indent);
-        }
-        _ => {}
+fn emit_property_names_checks(pn: &SchemaIr, checks: &mut Vec<String>, indent: &str, defs: &[DefEntry], prefix: &str) {
+    let m = emit_match_expression(pn, "JsonPrimitive(k)", defs, prefix);
+    if m == "true" {
+        return;
     }
+    checks.push(format!(
+        "{indent}for (k in obj.keys) {{ require({m}) {{ \"propertyNames\" }} }}"
+    ));
 }
 
-fn emit_not_check(not_schema: &SchemaIr, defs: &[DefEntry], counter: &mut usize) -> String {
-    let inner_validation = emit_validation(not_schema, defs, counter);
+fn emit_not_check(not_schema: &SchemaIr, defs: &[DefEntry], prefix: &str, counter: &mut usize) -> String {
+    let inner_validation = emit_validation(not_schema, defs, prefix, counter);
     if inner_validation.is_empty() {
         // not_schema accepts everything → nothing can pass
         return "        error(\"must not match excluded schema\")\n".to_string();
@@ -1070,9 +1313,10 @@ fn emit_conditional_check(
     then_schema: Option<&SchemaIr>,
     else_schema: Option<&SchemaIr>,
     defs: &[DefEntry],
+    prefix: &str,
     counter: &mut usize,
 ) -> String {
-    let if_validation = emit_validation(if_schema, defs, counter);
+    let if_validation = emit_validation(if_schema, defs, prefix, counter);
     let mut out = String::new();
 
     out.push_str(&format!(
@@ -1081,7 +1325,7 @@ fn emit_conditional_check(
     ));
 
     if let Some(then_s) = then_schema {
-        let then_validation = emit_validation(then_s, defs, counter);
+        let then_validation = emit_validation(then_s, defs, prefix, counter);
         if !then_validation.is_empty() {
             out.push_str(&format!(
                 "        if (ifMatched) {{ {} }}\n",
@@ -1090,7 +1334,7 @@ fn emit_conditional_check(
         }
     }
     if let Some(else_s) = else_schema {
-        let else_validation = emit_validation(else_s, defs, counter);
+        let else_validation = emit_validation(else_s, defs, prefix, counter);
         if !else_validation.is_empty() {
             out.push_str(&format!(
                 "        if (!ifMatched) {{ {} }}\n",
@@ -1102,10 +1346,10 @@ fn emit_conditional_check(
     out
 }
 
-fn emit_union_check(members: &[SchemaIr], defs: &[DefEntry], counter: &mut usize, exclusive: bool) -> String {
+fn emit_union_check(members: &[SchemaIr], defs: &[DefEntry], prefix: &str, counter: &mut usize, exclusive: bool) -> String {
     let mut branch_checks = Vec::new();
     for member in members {
-        let validation = emit_validation(member, defs, counter);
+        let validation = emit_validation(member, defs, prefix, counter);
         if validation.is_empty() {
             branch_checks.push("true".to_string());
         } else {
@@ -1153,7 +1397,8 @@ fn kotlin_type(ir: &SchemaIr, defs: &[DefEntry], prefix: &str) -> String {
         SchemaIr::Integer(_) => "Int".to_string(),
         SchemaIr::Boolean => "Boolean".to_string(),
         SchemaIr::Null => "Nothing?".to_string(),
-        SchemaIr::Any | SchemaIr::Unknown => "JsonElement".to_string(),
+        // TODO(kotlin-interpreter): validate via embedded spec interpreter
+        SchemaIr::Any | SchemaIr::Unknown | SchemaIr::Interpreted { .. } => "JsonElement".to_string(),
         SchemaIr::Never => "Nothing".to_string(),
 
         SchemaIr::Literal(lit) => match lit {

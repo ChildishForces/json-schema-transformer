@@ -16,6 +16,9 @@ RESULTS_DIR="$ROOT/conformance/results"
 RESULTS="$RESULTS_DIR/kotlin.json"
 
 KOTLINC="${KOTLINC:-kotlinc}"
+# kotlinc's launcher defaults to -Xmx256M, far too small now that interpreter
+# fixtures embed schemas + a mini-validator per file.
+export JAVA_OPTS="${JAVA_OPTS:--Xmx4g}"
 if [ -z "${KOTLIN_HOME:-}" ]; then
   if [ -d /opt/homebrew/opt/kotlin/libexec/lib ]; then
     KOTLIN_HOME=/opt/homebrew/opt/kotlin/libexec
