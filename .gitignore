@@ -1,0 +1,12 @@
+/target
+node_modules/
+.idea/
+
+# Regenerable conformance artifacts
+/conformance/generated/
+/conformance/results/
+/conformance/python/.venv/
+/conformance/swift/.build/
+/conformance/kotlin/build/
+/conformance/kotlin/libs/
+/conformance/kotlin/toolchain/

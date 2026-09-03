@@ -1,0 +1,11 @@
+{
+  "name": "conformance-ts-harness",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "conformance": "bun run run.ts"
+  },
+  "dependencies": {
+    "zod": "^3.23"
+  }
+}

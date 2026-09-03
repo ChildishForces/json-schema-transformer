@@ -1,0 +1,5 @@
+node_modules/
+bun.lock
+tests/__tmp__/
+tests/__spec_tmp__/
+tests/JSON-Schema-Test-Suite/

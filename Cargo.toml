@@ -1,0 +1,3 @@
+[workspace]
+members = ["crates/json-schema-transformer", "crates/jst-cli", "crates/conformance-gen"]
+resolver = "2"

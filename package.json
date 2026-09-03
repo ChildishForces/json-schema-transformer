@@ -1,0 +1,19 @@
+{
+  "name": "json-schema-transformer",
+  "private": true,
+  "scripts": {
+    "test": "bun scripts/test.ts",
+    "test:quick": "bun scripts/test.ts --quick",
+    "generate": "cargo build --workspace --all-features && ./target/debug/conformance-gen",
+    "conformance:zod": "bun run conformance/ts/run.ts",
+    "conformance:pydantic": "conformance/python/run.sh",
+    "conformance:swift": "conformance/swift/run.sh",
+    "conformance:kotlin": "conformance/kotlin/run.sh",
+    "build": "cargo build --workspace --all-features",
+    "build:release": "cargo build --workspace --all-features --release",
+    "format": "oxfmt"
+  },
+  "devDependencies": {
+    "oxfmt": "^0.66.0"
+  }
+}
