@@ -38,4 +38,4 @@ for (const [rel, re] of edits) {
 const lock = await $`cargo update --workspace --quiet`.cwd(ROOT).nothrow();
 if (lock.exitCode !== 0) process.exit(lock.exitCode);
 console.log(`Cargo.lock → ${version}`);
-console.log(`\nrelease with: git tag v${version} && git push --tags`);
+console.log(`\nrelease with: gh release create v${version} --generate-notes`);

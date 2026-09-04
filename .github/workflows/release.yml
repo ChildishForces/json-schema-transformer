@@ -1,5 +1,5 @@
-# Builds jst release binaries for macOS + Linux (both arches) when a version
-# tag (v*) is pushed, then creates a GitHub Release with:
+# Builds jst release binaries for macOS + Linux (both arches) when a GitHub
+# Release is published, and attaches to it:
 #   - jst-v<version>-<target>.tar.gz per target (binary + licenses)
 #   - jst_<version>_{amd64,arm64}.deb Debian/Ubuntu packages (from
 #     formulae/debian/)
@@ -10,11 +10,14 @@
 name: Release
 
 on:
-  push:
-    tags: ["v*"]
+  release:
+    types: [published]
 
 permissions:
   contents: write
+
+env:
+  TAG: ${{ github.event.release.tag_name }}
 
 jobs:
   build:
@@ -47,7 +50,7 @@ jobs:
 
       - name: Package
         run: |
-          name="jst-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          name="jst-${TAG}-${{ matrix.target }}"
           mkdir "$name"
           cp "target/${{ matrix.target }}/release/jst" LICENSE-MIT LICENSE-APACHE "$name/"
           tar -czf "$name.tar.gz" "$name"
@@ -55,7 +58,7 @@ jobs:
       - name: Package .deb
         if: matrix.deb_arch
         run: |
-          version="${GITHUB_REF_NAME#v}"
+          version="${TAG#v}"
           arch="${{ matrix.deb_arch }}"
           pkg="jst_${version}_${arch}"
           mkdir -p "$pkg/DEBIAN" "$pkg/usr/bin" "$pkg/usr/share/doc/jst"
@@ -79,13 +82,13 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Verify tag matches crate version
+      - name: Verify release tag matches crate version
         run: |
-          tag="${GITHUB_REF_NAME#v}"
+          tag="${TAG#v}"
           version="$(cargo metadata --format-version 1 --no-deps \
             | jq -r '.packages[] | select(.name == "jst-cli") | .version')"
           if [ "$version" != "$tag" ]; then
-            echo "tag v$tag does not match jst-cli version $version" >&2
+            echo "release tag v$tag does not match jst-cli version $version" >&2
             exit 1
           fi
 
@@ -99,8 +102,8 @@ jobs:
 
       - name: Render Homebrew formula
         run: |
-          version="${GITHUB_REF_NAME#v}"
-          sha() { shasum -a 256 "dist/jst-${GITHUB_REF_NAME}-$1.tar.gz" | cut -d' ' -f1; }
+          version="${TAG#v}"
+          sha() { shasum -a 256 "dist/jst-${TAG}-$1.tar.gz" | cut -d' ' -f1; }
           sed -e "s/{{version}}/$version/g" \
               -e "s/{{sha256_aarch64_apple_darwin}}/$(sha aarch64-apple-darwin)/" \
               -e "s/{{sha256_x86_64_apple_darwin}}/$(sha x86_64-apple-darwin)/" \
@@ -109,13 +112,10 @@ jobs:
               formulae/homebrew/jst.rb.template > dist/jst.rb
           grep -q '{{' dist/jst.rb && { echo "unreplaced placeholder in jst.rb" >&2; exit 1; } || true
 
-      - name: Create release
+      - name: Upload release assets
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release create "$GITHUB_REF_NAME" dist/* \
-            --title "$GITHUB_REF_NAME" \
-            --generate-notes
+        run: gh release upload "$TAG" dist/* --clobber
 
       # Pushes the rendered formula to the tap so brew picks the release up
       # immediately. Needs the HOMEBREW_TAP_TOKEN secret: a fine-grained PAT
@@ -134,4 +134,4 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add Formula/jst.rb
-          git diff --cached --quiet || { git commit -m "jst ${GITHUB_REF_NAME}" && git push; }
+          git diff --cached --quiet || { git commit -m "jst ${TAG}" && git push; }
