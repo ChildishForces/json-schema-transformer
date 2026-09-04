@@ -7,6 +7,7 @@
  *   bun scripts/test.ts --quick  # skip conformance suites
  */
 
+import { $ } from 'bun';
 import { existsSync, readFileSync } from 'fs';
 
 const SPINNER_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
@@ -26,7 +27,7 @@ const REPO_ROOT = new URL('..', import.meta.url).pathname.replace(/\/$/, '');
 
 interface Suite {
   name: string;
-  phase: 'build' | 'unit' | 'generate' | 'conformance';
+  phase: 'build' | 'unit' | 'integration' | 'generate' | 'conformance';
   command: string[];
   cwd: string;
   extract?: (output: string, suite?: Suite) => string;
@@ -52,10 +53,32 @@ const suites: Suite[] = [
     extract: (out) => {
       let total = 0;
       for (const m of out.matchAll(/(\d+) passed/g)) {
-        total += parseInt(m[1], 10);
+        total += parseInt(m[1] ?? '0', 10);
       }
       return total > 0 ? `${total} passed` : '';
     },
+  },
+  {
+    name: 'harness integration tests',
+    phase: 'integration',
+    command: [
+      'bun',
+      'test',
+      'conformance/ts/integration.test.ts',
+      'conformance/python/integration.test.ts',
+      'conformance/swift/integration.test.ts',
+      'conformance/kotlin/integration.test.ts',
+    ],
+    cwd: REPO_ROOT,
+    extract: (out) => {
+      const pass = out.match(/(\d+) pass/);
+      const fail = out.match(/(\d+) fail/);
+      const parts: string[] = [];
+      if (pass) parts.push(`${GREEN}${pass[1]} pass${RESET}`);
+      if (fail && fail[1] !== '0') parts.push(`${RED}${fail[1]} fail${RESET}`);
+      return parts.join(', ');
+    },
+    skip: quick,
   },
   {
     name: 'conformance fixtures',
@@ -84,7 +107,7 @@ const suites: Suite[] = [
   {
     name: 'Swift conformance',
     phase: 'conformance',
-    command: ['conformance/swift/run.sh'],
+    command: ['bun', 'conformance/swift/run.ts'],
     cwd: REPO_ROOT,
     resultsFile: 'conformance/results/swift.json',
     skip: quick,
@@ -92,7 +115,7 @@ const suites: Suite[] = [
   {
     name: 'Kotlin conformance',
     phase: 'conformance',
-    command: ['conformance/kotlin/run.sh'],
+    command: ['bun', 'conformance/kotlin/run.ts'],
     cwd: REPO_ROOT,
     resultsFile: 'conformance/results/kotlin.json',
     skip: quick,
@@ -224,23 +247,16 @@ async function runSuite(state: SuiteState): Promise<void> {
   }, 80);
 
   try {
-    const proc = Bun.spawn(state.suite.command, {
-      cwd: state.suite.cwd,
-      stdout: 'pipe',
-      stderr: 'pipe',
-      env: { ...process.env, FORCE_COLOR: '1' },
-    });
-
-    const [stdout, stderr] = await Promise.all([
-      new Response(proc.stdout).text(),
-      new Response(proc.stderr).text(),
-    ]);
-    const exitCode = await proc.exited;
+    const result = await $`${state.suite.command}`
+      .cwd(state.suite.cwd)
+      .env({ ...process.env, FORCE_COLOR: '1' })
+      .quiet()
+      .nothrow();
 
     state.elapsed = Date.now() - start;
-    state.output = stdout + stderr;
+    state.output = result.stdout.toString() + result.stderr.toString();
 
-    state.status = exitCode === 0 ? 'passed' : 'failed';
+    state.status = result.exitCode === 0 ? 'passed' : 'failed';
 
     if (state.suite.resultsFile) {
       const summary = extractResultsSummary(state.suite.resultsFile);
@@ -285,7 +301,7 @@ async function main() {
   render();
   const renderInterval = isTTY ? setInterval(render, 80) : null;
 
-  const phases = ['build', 'unit', 'generate', 'conformance'];
+  const phases = ['build', 'unit', 'integration', 'generate', 'conformance'];
   let allPassed = true;
 
   for (const phase of phases) {

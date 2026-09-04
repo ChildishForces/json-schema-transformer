@@ -17,71 +17,88 @@ pub use emit::ZodEmitter;
 pub use input::{ConvertError, Converter};
 pub use ir::{ConvertedSchema, SchemaIr};
 
+/// Resolve the module/type name: explicit argument first, then the schema's
+/// root `title`. Errors when neither is available.
+fn resolve_name(schema: &serde_json::Value, name: Option<&str>) -> Result<String, ConvertError> {
+    if let Some(n) = name {
+        return Ok(n.to_string());
+    }
+    schema
+        .as_object()
+        .and_then(|o| o.get("title"))
+        .and_then(|t| t.as_str())
+        .map(|t| t.to_string())
+        .ok_or(ConvertError::MissingName)
+}
+
 /// Convert a JSON Schema using the given emitter strategy.
+///
+/// `name` determines the generated root type name (PascalCased). When None,
+/// the schema's root `title` is used; if that is also absent this returns
+/// [`ConvertError::MissingName`].
 pub fn transform(
     schema: &serde_json::Value,
     emitter: &dyn Emitter,
-    name: &str,
-    namespace: &str,
-    version: u32,
+    name: Option<&str>,
 ) -> Result<String, ConvertError> {
+    transform_with_options(schema, emitter, name, &emit::EmitOptions::default())
+}
+
+/// Like [`transform`], honoring [`emit::EmitOptions`] (e.g. shared helpers).
+pub fn transform_with_options(
+    schema: &serde_json::Value,
+    emitter: &dyn Emitter,
+    name: Option<&str>,
+    options: &emit::EmitOptions,
+) -> Result<String, ConvertError> {
+    let resolved = resolve_name(schema, name)?;
     let converted = Converter::convert(schema)?;
-    Ok(emitter.emit(&converted, name, namespace, version))
+    Ok(emitter.emit_with_options(&converted, &resolved, options))
 }
 
 /// Convert a JSON Schema to a complete Zod TypeScript module string.
 #[cfg(feature = "zod")]
 pub fn json_schema_to_zod_module(
     schema: &serde_json::Value,
-    name: &str,
-    namespace: &str,
-    version: u32,
+    name: Option<&str>,
 ) -> Result<String, ConvertError> {
-    transform(schema, &ZodEmitter, name, namespace, version)
+    transform(schema, &ZodEmitter, name)
 }
 
 /// Convert a JSON Schema to TypeScript type definitions (.d.ts).
 #[cfg(feature = "typescript")]
 pub fn json_schema_to_typescript(
     schema: &serde_json::Value,
-    name: &str,
-    namespace: &str,
-    version: u32,
+    name: Option<&str>,
 ) -> Result<String, ConvertError> {
-    transform(schema, &TypeScriptEmitter, name, namespace, version)
+    transform(schema, &TypeScriptEmitter, name)
 }
 
 /// Convert a JSON Schema to a Python Pydantic model.
 #[cfg(feature = "pydantic")]
 pub fn json_schema_to_pydantic(
     schema: &serde_json::Value,
-    name: &str,
-    namespace: &str,
-    version: u32,
+    name: Option<&str>,
 ) -> Result<String, ConvertError> {
-    transform(schema, &PydanticEmitter, name, namespace, version)
+    transform(schema, &PydanticEmitter, name)
 }
 
 /// Convert a JSON Schema to a Swift Codable struct.
 #[cfg(feature = "swift")]
 pub fn json_schema_to_swift(
     schema: &serde_json::Value,
-    name: &str,
-    namespace: &str,
-    version: u32,
+    name: Option<&str>,
 ) -> Result<String, ConvertError> {
-    transform(schema, &SwiftEmitter, name, namespace, version)
+    transform(schema, &SwiftEmitter, name)
 }
 
 /// Convert a JSON Schema to a Kotlin data class.
 #[cfg(feature = "kotlin")]
 pub fn json_schema_to_kotlin(
     schema: &serde_json::Value,
-    name: &str,
-    namespace: &str,
-    version: u32,
+    name: Option<&str>,
 ) -> Result<String, ConvertError> {
-    transform(schema, &KotlinEmitter, name, namespace, version)
+    transform(schema, &KotlinEmitter, name)
 }
 
 #[cfg(all(test, feature = "zod"))]
@@ -384,9 +401,9 @@ mod tests {
             },
             "required": ["address"]
         });
-        let module = json_schema_to_zod_module(&schema, "person", "test", 1).unwrap();
+        let module = json_schema_to_zod_module(&schema, Some("person")).unwrap();
         assert!(module.contains("AddressSchema"));
-        assert!(module.contains("PersonV1DataSchema"));
+        assert!(module.contains("PersonSchema"));
     }
 
     #[test]
@@ -407,18 +424,41 @@ mod tests {
             },
             "$ref": "#/$defs/Node"
         });
-        let module = json_schema_to_zod_module(&schema, "tree", "test", 1).unwrap();
+        let module = json_schema_to_zod_module(&schema, Some("tree")).unwrap();
         assert!(module.contains("z.lazy("));
         assert!(module.contains("z.ZodType<"));
     }
 
     #[test]
+    fn name_falls_back_to_title() {
+        let schema = json!({"title": "User Created", "type": "string"});
+        let module = json_schema_to_zod_module(&schema, None).unwrap();
+        assert!(module.contains("export const UserCreatedSchema"));
+    }
+
+    #[test]
+    fn explicit_name_beats_title() {
+        let schema = json!({"title": "User Created", "type": "string"});
+        let module = json_schema_to_zod_module(&schema, Some("override")).unwrap();
+        assert!(module.contains("export const OverrideSchema"));
+    }
+
+    #[test]
+    fn missing_name_is_an_error() {
+        let schema = json!({"type": "string"});
+        assert!(matches!(
+            json_schema_to_zod_module(&schema, None),
+            Err(ConvertError::MissingName)
+        ));
+    }
+
+    #[test]
     fn full_module_structure() {
         let schema = json!({"type": "object", "properties": {"id": {"type": "string", "format": "uuid"}}, "required": ["id"]});
-        let module = json_schema_to_zod_module(&schema, "something-happened", "trade", 1).unwrap();
+        let module = json_schema_to_zod_module(&schema, Some("something-happened")).unwrap();
         assert!(module.contains("import { z } from \"zod\""));
-        assert!(module.contains("export const SomethingHappenedV1DataSchema"));
-        assert!(module.contains("export type SomethingHappenedV1Data"));
+        assert!(module.contains("export const SomethingHappenedSchema"));
+        assert!(module.contains("export type SomethingHappened"));
         assert!(module.contains("z.string().uuid()"));
     }
 }

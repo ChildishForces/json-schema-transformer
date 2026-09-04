@@ -15,17 +15,15 @@ use json_schema_transformer::emit::{
 };
 use serde::Serialize;
 
-const NAMESPACE: &str = "spec";
-const VERSION: u32 = 1;
 
 #[derive(Parser, Debug)]
 struct Args {
     /// Directory containing the suite's draft test files (e.g. tests/draft2020-12)
-    #[arg(long, default_value = "JSON-Schema-Test-Suite/tests/draft2020-12")]
+    #[arg(long, default_value = "fixtures/JSON-Schema-Test-Suite/tests/draft2020-12")]
     suite: PathBuf,
 
     /// Directory of remote schema documents, mapped to http://localhost:1234/<relpath>
-    #[arg(long, default_value = "JSON-Schema-Test-Suite/remotes")]
+    #[arg(long, default_value = "fixtures/JSON-Schema-Test-Suite/remotes")]
     remotes: PathBuf,
 
     /// Output directory for generated fixtures and manifest
@@ -108,8 +106,6 @@ struct ManifestGroup {
 #[derive(Serialize)]
 struct Manifest {
     draft: String,
-    namespace: String,
-    version: u32,
     groups: Vec<ManifestGroup>,
 }
 
@@ -162,7 +158,7 @@ fn emit_guarded(
         let options = EmitOptions {
             helpers_file: emitter.default_helpers_file().map(|s| s.to_string()),
         };
-        Ok(emitter.emit_with_options(&converted, name, NAMESPACE, VERSION, &options))
+        Ok(emitter.emit_with_options(&converted, name, &options))
     }));
     match result {
         Ok(inner) => inner,
@@ -219,7 +215,7 @@ fn main() -> anyhow::Result<()> {
         for (gi, group) in suite_groups.into_iter().enumerate() {
             let name = format!("{keyword}-g{gi}");
             let pascal = to_pascal_case(&name);
-            let type_name = format!("{pascal}V{VERSION}Data");
+            let type_name = pascal.clone();
 
             let mut files = BTreeMap::new();
             let mut errors = BTreeMap::new();
@@ -263,8 +259,6 @@ fn main() -> anyhow::Result<()> {
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default(),
-        namespace: NAMESPACE.to_string(),
-        version: VERSION,
         groups,
     };
 

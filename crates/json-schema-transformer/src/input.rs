@@ -9,6 +9,8 @@ use crate::ir::*;
 pub enum ConvertError {
     #[error("unsupported JSON Schema feature: {0}")]
     Unsupported(String),
+    #[error("no name provided and the schema has no root \"title\"")]
+    MissingName,
 }
 
 pub struct Converter {

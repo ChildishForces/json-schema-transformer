@@ -13,12 +13,10 @@ impl Emitter for TypeScriptEmitter {
         &self,
         converted: &ConvertedSchema,
         name: &str,
-        namespace: &str,
-        version: u32,
         _options: &EmitOptions,
     ) -> String {
         let pascal = to_pascal_case(name);
-        let mut out = module_header(namespace, name, version);
+        let mut out = module_header(name);
         out.push('\n');
 
         // Emit definitions
@@ -28,7 +26,7 @@ impl Emitter for TypeScriptEmitter {
         }
 
         // Emit root type
-        let root_name = format!("{pascal}V{version}Data");
+        let root_name = pascal.clone();
         out.push_str(&emit_type_def(&root_name, &converted.root, &converted.defs));
 
         out

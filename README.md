@@ -25,7 +25,8 @@ conformance/
   ts/ python/ swift/ kotlin/ Native-language conformance harnesses (see Testing).
   generated/                 Generated fixtures + manifest.json (regenerable, gitignored).
   results/                   Per-language results JSON (regenerable, gitignored).
-JSON-Schema-Test-Suite/      Official test suite (git submodule).
+fixtures/
+  JSON-Schema-Test-Suite/    Official test suite (git submodule).
 scripts/test.ts              Orchestrates build → unit → generate → conformance.
 ```
 
@@ -43,7 +44,10 @@ json-schema-transformer = { version = "0.1", features = ["zod", "swift"] }
 use json_schema_transformer::{transform, ZodEmitter};
 
 let schema: serde_json::Value = serde_json::from_str(raw)?;
-let code = transform(&schema, &ZodEmitter, "user-created", "users", 1)?;
+// Name: explicit argument, or the schema's root "title" when None.
+// Neither present → Err(ConvertError::MissingName).
+let code = transform(&schema, &ZodEmitter, Some("user-created"))?;
+let code = transform(&schema, &ZodEmitter, None)?; // uses schema "title"
 ```
 
 ## CLI
@@ -58,7 +62,7 @@ jst schema.json --target zod
 jst schema.json --out-dir ./generated
 
 # From stdin, custom naming
-echo '{"type":"string"}' | jst - --target swift --name my-type --namespace api --schema-version 2
+echo '{"type":"string"}' | jst - --target swift --name my-type
 
 # Shared helpers: utilities (validators, wrapper types) go to a separate
 # companion file instead of being inlined into each schema module
@@ -66,7 +70,7 @@ jst schema.json --target zod --out-dir ./generated --helpers-file            # p
 jst schema.json --target zod --out-dir ./generated --helpers-file utils.ts   # custom name
 ```
 
-Generated root types are named `{PascalName}V{version}Data` to keep multiple schema versions collision-free.
+The generated root type name is the PascalCased name, resolved in order: `--name` argument, the schema's root `title`, then the input file's stem (library callers get `ConvertError::MissingName` instead of the file-stem fallback).
 
 By default every generated module is fully self-contained. With `--helpers-file` (library: `EmitOptions { helpers_file }` and `Emitter::helpers_content()`), shared utilities are emitted once into a companion file — `jst-helpers.ts` / `jst_helpers.py` / `JstHelpers.swift` / `JstHelpers.kt` — and schema modules reference them (imports in TypeScript/Python, same-module internal declarations in Swift/Kotlin). This keeps schema files free of utility noise and avoids duplicated declarations when many generated files are compiled together.
 
@@ -74,9 +78,12 @@ By default every generated module is fully self-contained. With `--helpers-file`
 
 ```bash
 git submodule update --init  # first time: fetch the JSON Schema test suite
-bun scripts/test.ts          # everything: build, unit, fixtures, all 4 conformance suites (~45s)
+bun scripts/test.ts          # build, unit, integration, fixtures, all 4 conformance suites (~50s)
 bun scripts/test.ts --quick  # build + unit tests only
+bun run test:integration     # per-harness integration tests only (jst CLI → generated code → native run)
 ```
+
+Each harness also has an integration test (`conformance/<lang>/integration.test.ts`) that drives the real `jst` CLI over a sample schema (name from `title`, shared-helpers mode) and executes the generated code natively, asserting accept/reject behavior.
 
 Conformance testing runs the full official test suite **natively in each output language** — each harness compiles/loads all 383 generated fixture modules once and executes all 1,299 cases in a single process:
 
@@ -84,10 +91,10 @@ Conformance testing runs the full official test suite **natively in each output 
 | -------- | ------------------------------- | ---------------------------------- |
 | Zod      | `bun run conformance/ts/run.ts` | < 0.3s                             |
 | Pydantic | `conformance/python/run.sh`     | ~1s                                |
-| Swift    | `conformance/swift/run.sh`      | ~13s (one `swiftc` batch compile)  |
-| Kotlin   | `conformance/kotlin/run.sh`     | ~25s (one `kotlinc` batch compile) |
+| Swift    | `bun conformance/swift/run.ts`  | ~7s (one `swiftc` batch compile)   |
+| Kotlin   | `bun conformance/kotlin/run.ts` | ~25s (one `kotlinc` batch compile) |
 
-Fixtures are produced by `conformance-gen`, which walks `JSON-Schema-Test-Suite/tests/draft2020-12`, converts every test group through every emitter, and writes `conformance/generated/manifest.json` describing each group (type name, generated file per language, expected validity per test). Generation errors are recorded in the manifest and counted as failures by the harnesses — no test is silently skipped.
+Fixtures are produced by `conformance-gen`, which walks `fixtures/JSON-Schema-Test-Suite/tests/draft2020-12`, converts every test group through every emitter, and writes `conformance/generated/manifest.json` describing each group (type name, generated file per language, expected validity per test). Generation errors are recorded in the manifest and counted as failures by the harnesses — no test is silently skipped.
 
 Requirements per harness: bun (Zod), python3 + venv (Pydantic — created automatically at `conformance/python/.venv`), swiftc (Swift), kotlinc + java (Kotlin — serialization jars vendored in `conformance/kotlin/libs/`).
 

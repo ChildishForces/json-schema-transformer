@@ -1,10 +1,7 @@
 {
-  "name": "conformance-ts-harness",
+  "name": "conformance-kotlin-harness",
   "private": true,
   "type": "module",
-  "scripts": {
-    "conformance": "bun run run.ts"
-  },
   "dependencies": {
     "zod": "catalog:"
   },

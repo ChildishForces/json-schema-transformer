@@ -52,17 +52,10 @@ struct Args {
     #[arg(short, long, value_enum)]
     target: Vec<Target>,
 
-    /// Logical schema name used in generated type names (default: schema file stem)
+    /// Name used for generated type names (default: the schema's root "title",
+    /// falling back to the input file stem)
     #[arg(short, long)]
     name: Option<String>,
-
-    /// Namespace recorded in the generated file header
-    #[arg(long, default_value = "schemas")]
-    namespace: String,
-
-    /// Schema version, embedded in generated type names
-    #[arg(long, default_value_t = 1)]
-    schema_version: u32,
 
     /// Write output file(s) to this directory as <name>.<ext>
     #[arg(short = 'd', long)]
@@ -96,18 +89,22 @@ fn main() -> anyhow::Result<()> {
 
     let schema: serde_json::Value = serde_json::from_str(&raw).context("invalid JSON")?;
 
-    let name = match &args.name {
-        Some(n) => n.clone(),
-        None => {
-            if args.schema.as_os_str() == "-" {
-                "schema".to_string()
-            } else {
-                args.schema
-                    .file_stem()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "schema".to_string())
-            }
-        }
+    // Name resolution order: --name, then the schema's root "title",
+    // then (CLI only) the input file's stem
+    let title = schema
+        .as_object()
+        .and_then(|o| o.get("title"))
+        .and_then(|t| t.as_str())
+        .map(|t| t.to_string());
+    let file_stem = if args.schema.as_os_str() == "-" {
+        None
+    } else {
+        args.schema
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+    };
+    let Some(name) = args.name.clone().or(title).or(file_stem) else {
+        bail!("cannot determine a name: pass --name, or add a root \"title\" to the schema");
     };
 
     let targets = if args.target.is_empty() {
@@ -149,13 +146,7 @@ fn main() -> anyhow::Result<()> {
         };
         let options = EmitOptions { helpers_file: helpers_file.clone() };
 
-        let output = emitter.emit_with_options(
-            &converted,
-            &name,
-            &args.namespace,
-            args.schema_version,
-            &options,
-        );
+        let output = emitter.emit_with_options(&converted, &name, &options);
 
         if let (Some(filename), Some(content)) = (&helpers_file, emitter.helpers_content()) {
             let dir = helper_dir.clone().unwrap_or_else(|| PathBuf::from("."));

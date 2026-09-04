@@ -1,19 +1,34 @@
 {
   "name": "json-schema-transformer",
   "private": true,
+  "workspaces": {
+    "packages": [
+      "conformance/kotlin",
+      "conformance/python",
+      "conformance/swift",
+      "conformance/ts"
+    ],
+    "catalog": {
+      "zod": "^4.5.4"
+    }
+  },
   "scripts": {
     "test": "bun scripts/test.ts",
     "test:quick": "bun scripts/test.ts --quick",
     "generate": "cargo build --workspace --all-features && ./target/debug/conformance-gen",
     "conformance:zod": "bun run conformance/ts/run.ts",
     "conformance:pydantic": "conformance/python/run.sh",
-    "conformance:swift": "conformance/swift/run.sh",
-    "conformance:kotlin": "conformance/kotlin/run.sh",
+    "conformance:swift": "bun conformance/swift/run.ts",
+    "conformance:kotlin": "bun conformance/kotlin/run.ts",
     "build": "cargo build --workspace --all-features",
     "build:release": "cargo build --workspace --all-features --release",
-    "format": "oxfmt"
+    "format": "oxfmt",
+    "test:integration": "bun test conformance/ts/integration.test.ts conformance/python/integration.test.ts conformance/swift/integration.test.ts conformance/kotlin/integration.test.ts"
   },
   "devDependencies": {
-    "oxfmt": "^0.66.0"
+    "@types/bun": "^1.4.0",
+    "oxfmt": "^0.66.0",
+    "typescript": "^7",
+    "zod": "catalog:"
   }
 }

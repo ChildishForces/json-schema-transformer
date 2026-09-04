@@ -13,11 +13,9 @@ impl Emitter for ZodEmitter {
         &self,
         converted: &ConvertedSchema,
         name: &str,
-        namespace: &str,
-        version: u32,
         options: &EmitOptions,
     ) -> String {
-        emit_module(converted, name, namespace, version, options)
+        emit_module(converted, name, options)
     }
 
     fn helpers_content(&self) -> Option<String> {
@@ -54,14 +52,12 @@ const JSI_HELPER: &str = include_str!("jsi_validator.ts");
 pub fn emit_module(
     converted: &ConvertedSchema,
     name: &str,
-    namespace: &str,
-    version: u32,
     options: &EmitOptions,
 ) -> String {
     let pascal = to_pascal_case(name);
     let mut out = String::new();
 
-    out.push_str(&module_header(namespace, name, version));
+    out.push_str(&module_header(name));
     out.push('\n');
     out.push_str("import { z } from \"zod\";\n");
 
@@ -110,48 +106,47 @@ pub fn emit_module(
         }
     }
 
-    if !converted.defs.is_empty() {
-        out.push_str("\n// --- Definitions ---\n");
-        for def in &converted.defs {
-            if def.is_recursive {
-                let type_str = zod_ts_type(&def.schema, &converted.defs);
-                out.push_str(&format!(
-                    "type {name} = {type_str};\n",
-                    name = def.name,
-                    type_str = type_str
-                ));
-                out.push_str(&format!(
-                    "const {name}Schema: z.ZodType<{name}> = z.lazy(() => {zod});\n",
-                    name = def.name,
-                    zod = zod_for(&def.schema, &converted.defs)
-                ));
-            } else {
-                out.push_str(&format!(
-                    "const {name}Schema = {zod};\n",
-                    name = def.name,
-                    zod = zod_for(&def.schema, &converted.defs)
-                ));
-                out.push_str(&format!(
-                    "type {name} = z.infer<typeof {name}Schema>;\n",
-                    name = def.name
-                ));
-            }
-            out.push('\n');
+    // Type aliases are order-independent in TypeScript, so schemas can
+    // reference types declared in the section below
+    let mut types = String::new();
+
+    out.push_str("\n// Schema\n");
+    for def in &converted.defs {
+        if def.is_recursive {
+            out.push_str(&format!(
+                "const {name}Schema: z.ZodType<{name}> = z.lazy(() => {zod});\n\n",
+                name = def.name,
+                zod = zod_for(&def.schema, &converted.defs)
+            ));
+            types.push_str(&format!(
+                "type {name} = {type_str};\n",
+                name = def.name,
+                type_str = zod_ts_type(&def.schema, &converted.defs)
+            ));
+        } else {
+            out.push_str(&format!(
+                "const {name}Schema = {zod};\n\n",
+                name = def.name,
+                zod = zod_for(&def.schema, &converted.defs)
+            ));
+            types.push_str(&format!(
+                "type {name} = z.infer<typeof {name}Schema>;\n",
+                name = def.name
+            ));
         }
     }
-
-    out.push_str("// --- Root schema ---\n");
     out.push_str(&format!(
-        "export const {pascal}V{version}DataSchema = {zod};\n",
+        "export const {pascal}Schema = {zod};\n",
         pascal = pascal,
-        version = version,
         zod = zod_for(&converted.root, &converted.defs)
     ));
-    out.push_str(&format!(
-        "export type {pascal}V{version}Data = z.infer<typeof {pascal}V{version}DataSchema>;\n",
+    types.push_str(&format!(
+        "export type {pascal} = z.infer<typeof {pascal}Schema>;\n",
         pascal = pascal,
-        version = version
     ));
+
+    out.push_str("\n// Types\n");
+    out.push_str(&types);
 
     out
 }
@@ -179,7 +174,16 @@ pub fn zod_for(ir: &SchemaIr, defs: &[DefEntry]) -> String {
             );
         }
         SchemaIr::String(c) => {
-            let mut s = "z.string()".to_string();
+            // zod v4 removed z.string().ip(); ipv4/ipv6 use the top-level
+            // format schemas (still ZodString subclasses, so chaining works),
+            // and version-agnostic "ip" is their union
+            let is_ip_union = matches!(&c.format, Some(StringFormat::Ip));
+            let mut s = match &c.format {
+                Some(StringFormat::Ipv4) => "z.ipv4()".to_string(),
+                Some(StringFormat::Ipv6) => "z.ipv6()".to_string(),
+                Some(StringFormat::Ip) => "z.union([z.ipv4(), z.ipv6()])".to_string(),
+                _ => "z.string()".to_string(),
+            };
             if let Some(fmt) = &c.format {
                 s.push_str(match fmt {
                     StringFormat::Email => ".email()",
@@ -189,9 +193,8 @@ pub fn zod_for(ir: &SchemaIr, defs: &[DefEntry]) -> String {
                     StringFormat::Date => ".date()",
                     StringFormat::Time => ".time()",
                     StringFormat::Duration => ".duration()",
-                    StringFormat::Ip => ".ip()",
-                    StringFormat::Ipv4 => ".ip({ version: \"v4\" })",
-                    StringFormat::Ipv6 => ".ip({ version: \"v6\" })",
+                    // "ip" (either version) is appended as a trailing refine below
+                    StringFormat::Ip | StringFormat::Ipv4 | StringFormat::Ipv6 => "",
                     StringFormat::Hostname => "",
                     StringFormat::Base64 => ".base64()",
                 });
@@ -199,7 +202,12 @@ pub fn zod_for(ir: &SchemaIr, defs: &[DefEntry]) -> String {
             if let Some(pat) = &c.pattern {
                 // Add unicode flag if pattern uses Unicode property escapes
                 let flag = if pat.contains("\\p{") || pat.contains("\\P{") { "u" } else { "" };
-                s.push_str(&format!(".regex(/{pat}/{flag})"));
+                if is_ip_union {
+                    // .regex() is a ZodString method; the ip union chains via refine
+                    s.push_str(&format!(".refine((v) => /{pat}/{flag}.test(v))"));
+                } else {
+                    s.push_str(&format!(".regex(/{pat}/{flag})"));
+                }
             }
             // JSON Schema counts Unicode code points, not UTF-16 units — use a
             // superRefine (must come after string-builder methods like .regex)
