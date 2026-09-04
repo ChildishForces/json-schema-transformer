@@ -52,9 +52,24 @@ let code = transform(&schema, &ZodEmitter, None)?; // uses schema "title"
 
 ## CLI
 
+Install with Homebrew (macOS and Linux):
+
+```bash
+brew install childishforces/tap/jst
+```
+
+Debian/Ubuntu packages (`jst_<version>_{amd64,arm64}.deb`) and prebuilt
+binaries for macOS and Linux are attached to each
+[GitHub Release](https://github.com/ChildishForces/json-schema-transformer/releases),
+or build from source:
+
 ```bash
 cargo build --release -p jst-cli
+```
 
+Usage:
+
+```bash
 # Single target to stdout
 jst schema.json --target zod
 

@@ -116,3 +116,22 @@ jobs:
           gh release create "$GITHUB_REF_NAME" dist/* \
             --title "$GITHUB_REF_NAME" \
             --generate-notes
+
+      # Pushes the rendered formula to the tap so brew picks the release up
+      # immediately. Needs the HOMEBREW_TAP_TOKEN secret: a fine-grained PAT
+      # with contents read/write on ChildishForces/homebrew-tap.
+      - name: Update Homebrew tap
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::warning::HOMEBREW_TAP_TOKEN not set; skipping tap update — copy the jst.rb release asset to the tap manually"
+            exit 0
+          fi
+          git clone --depth 1 "https://x-access-token:${GH_TOKEN}@github.com/ChildishForces/homebrew-tap.git" tap
+          cp dist/jst.rb tap/Formula/jst.rb
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/jst.rb
+          git diff --cached --quiet || { git commit -m "jst ${GITHUB_REF_NAME}" && git push; }

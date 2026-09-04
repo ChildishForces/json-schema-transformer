@@ -5,11 +5,11 @@ the Release workflow renders it with the release version and the sha256 of
 each binary tarball, and attaches the result to the GitHub Release as
 `jst.rb`.
 
-To publish a release to Homebrew:
-
-1. Create the tap repo once: `ChildishForces/homebrew-tap`.
-2. After each release, copy the `jst.rb` asset from the GitHub Release into
-   the tap as `Formula/jst.rb` and push.
+The workflow then pushes the rendered formula to the
+`ChildishForces/homebrew-tap` repo (as `Formula/jst.rb`) via the
+`HOMEBREW_TAP_TOKEN` secret — a fine-grained PAT with contents read/write on
+the tap repo. If the secret is unset, the workflow warns and skips the push;
+copy the `jst.rb` release asset into the tap manually in that case.
 
 Users then install with:
 

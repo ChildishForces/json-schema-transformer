@@ -13,6 +13,7 @@
     }
   },
   "scripts": {
+    "bump": "bun scripts/bump-version.ts",
     "test": "bun scripts/test.ts",
     "test:quick": "bun scripts/test.ts --quick",
     "generate": "cargo build --workspace --all-features && ./target/debug/conformance-gen",
