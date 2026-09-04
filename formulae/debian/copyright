@@ -1,0 +1,12 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: jst
+Upstream-Contact: Chris Schofield <chris@childishforces.com>
+Source: https://github.com/ChildishForces/json-schema-transformer
+
+Files: *
+Copyright: 2026 Chris Schofield
+License: MIT or Apache-2.0
+ Licensed under either of the MIT license or the Apache License, Version 2.0,
+ at your option. See the LICENSE-MIT and LICENSE-APACHE files in the source
+ repository for the full license texts:
+ https://github.com/ChildishForces/json-schema-transformer

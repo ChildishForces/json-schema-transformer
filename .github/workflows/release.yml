@@ -1,0 +1,118 @@
+# Builds jst release binaries for macOS + Linux (both arches) when a version
+# tag (v*) is pushed, then creates a GitHub Release with:
+#   - jst-v<version>-<target>.tar.gz per target (binary + licenses)
+#   - jst_<version>_{amd64,arm64}.deb Debian/Ubuntu packages (from
+#     formulae/debian/)
+#   - SHA256SUMS
+#   - jst.rb — the Homebrew formula rendered from formulae/homebrew/jst.rb.template
+#     with the real version + checksums, ready to drop into the tap repo.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+          - target: x86_64-apple-darwin
+            runner: macos-latest
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            deb_arch: amd64
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            deb_arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release -p jst-cli --target ${{ matrix.target }}
+        env:
+          CARGO_PROFILE_RELEASE_STRIP: "true"
+
+      - name: Package
+        run: |
+          name="jst-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir "$name"
+          cp "target/${{ matrix.target }}/release/jst" LICENSE-MIT LICENSE-APACHE "$name/"
+          tar -czf "$name.tar.gz" "$name"
+
+      - name: Package .deb
+        if: matrix.deb_arch
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          arch="${{ matrix.deb_arch }}"
+          pkg="jst_${version}_${arch}"
+          mkdir -p "$pkg/DEBIAN" "$pkg/usr/bin" "$pkg/usr/share/doc/jst"
+          cp "target/${{ matrix.target }}/release/jst" "$pkg/usr/bin/"
+          cp formulae/debian/copyright "$pkg/usr/share/doc/jst/"
+          sed -e "s/{{version}}/$version/" -e "s/{{arch}}/$arch/" \
+            formulae/debian/control.template > "$pkg/DEBIAN/control"
+          dpkg-deb --build --root-owner-group "$pkg"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jst-${{ matrix.target }}
+          path: |
+            *.tar.gz
+            *.deb
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Verify tag matches crate version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          version="$(cargo metadata --format-version 1 --no-deps \
+            | jq -r '.packages[] | select(.name == "jst-cli") | .version')"
+          if [ "$version" != "$tag" ]; then
+            echo "tag v$tag does not match jst-cli version $version" >&2
+            exit 1
+          fi
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: cd dist && shasum -a 256 *.tar.gz *.deb > SHA256SUMS
+
+      - name: Render Homebrew formula
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          sha() { shasum -a 256 "dist/jst-${GITHUB_REF_NAME}-$1.tar.gz" | cut -d' ' -f1; }
+          sed -e "s/{{version}}/$version/g" \
+              -e "s/{{sha256_aarch64_apple_darwin}}/$(sha aarch64-apple-darwin)/" \
+              -e "s/{{sha256_x86_64_apple_darwin}}/$(sha x86_64-apple-darwin)/" \
+              -e "s/{{sha256_aarch64_unknown_linux_gnu}}/$(sha aarch64-unknown-linux-gnu)/" \
+              -e "s/{{sha256_x86_64_unknown_linux_gnu}}/$(sha x86_64-unknown-linux-gnu)/" \
+              formulae/homebrew/jst.rb.template > dist/jst.rb
+          grep -q '{{' dist/jst.rb && { echo "unreplaced placeholder in jst.rb" >&2; exit 1; } || true
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes

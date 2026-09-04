@@ -1,0 +1,11 @@
+Package: jst
+Version: {{version}}
+Architecture: {{arch}}
+Maintainer: Chris Schofield <chris@childishforces.com>
+Homepage: https://github.com/ChildishForces/json-schema-transformer
+Section: utils
+Priority: optional
+Depends: libc6
+Description: Convert JSON Schema to Zod, TypeScript, Pydantic, Swift, and Kotlin
+ Command-line tool for json-schema-transformer: generates native types and
+ validation schemas from JSON Schema draft 2020-12 documents.
