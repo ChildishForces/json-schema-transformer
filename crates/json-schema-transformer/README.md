@@ -4,17 +4,17 @@ A Rust crate that converts JSON Schema (Draft 2020-12) into typed code for multi
 
 ## Features
 
-Each emitter is an opt-in cargo feature: `zod`, `typescript`, `pydantic`, `swift`, `kotlin`, or `all-emitters` for everything. No emitters are enabled by default — the parser and IR are always available.
+Each emitter is an opt-in cargo feature: `zod`, `typescript`, `pydantic`, `swift`, `kotlin`, `rust`, or `all-emitters` for everything. No emitters are enabled by default — the parser and IR are always available.
 
 ```toml
 [dependencies]
-json-schema-transformer = { version = "0.1", features = ["zod", "swift"] }
+json-schema-transformer = { version = "0.2", features = ["zod", "swift"] }
 ```
 
 ## Usage
 
 ```rust
-use json_schema_transformer::{transform, ZodEmitter, PydanticEmitter, TypeScriptEmitter, SwiftEmitter, KotlinEmitter};
+use json_schema_transformer::{transform, ZodEmitter, PydanticEmitter, TypeScriptEmitter, SwiftEmitter, KotlinEmitter, RustEmitter};
 use serde_json::json;
 
 let schema = json!({
@@ -33,6 +33,7 @@ let ts = transform(&schema, &TypeScriptEmitter, Some("user-created")).unwrap();
 let py = transform(&schema, &PydanticEmitter, Some("user-created")).unwrap();
 let swift = transform(&schema, &SwiftEmitter, Some("user-created")).unwrap();
 let kt = transform(&schema, &KotlinEmitter, Some("user-created")).unwrap();
+let rs = transform(&schema, &RustEmitter, Some("user-created")).unwrap();
 
 // Or use convenience functions
 use json_schema_transformer::json_schema_to_zod_module;
@@ -52,7 +53,8 @@ JSON Schema ──► input.rs (parse) ──► SchemaIr ──► emit/*.rs (e
                                         ├──► typescript.rs   → .d.ts
                                         ├──► pydantic.rs     → .py
                                         ├──► swift.rs        → .swift
-                                        └──► kotlin.rs       → .kt
+                                        ├──► kotlin.rs       → .kt
+                                        └──► rust/           → .rs
 ```
 
 ### Parse (`input.rs`): JSON Schema to SchemaIr
@@ -120,10 +122,14 @@ pub trait Emitter {
     fn extension(&self) -> &str;
     fn emit(&self, converted: &ConvertedSchema, name: &str) -> String;
     fn emit_with_options(&self, converted: &ConvertedSchema, name: &str, options: &EmitOptions) -> String;
+    fn emit_collecting(&self, converted: &ConvertedSchema, name: &str, options: &EmitOptions) -> (String, HelperSet);
+    fn helpers_content_for(&self, needs: &HelperSet) -> Option<String>;
     fn helpers_content(&self) -> Option<String>;
     fn default_helpers_file(&self) -> Option<&'static str>;
 }
 ```
+
+`EmitOptions { helpers: Option<SharedHelpers>, mutable: bool }` selects the mode: `helpers: None` inlines all helpers (single-file), `Some` references a shared companion file (collection), with `SharedHelpers { file_name, dir_prefix }` carrying the helpers file name and the module's relative depth for import paths. `mutable` emits mutable stored properties (Swift/Kotlin `var`; Pydantic `validate_assignment`) — validation APIs are emitted regardless. `CollectionSession` (in `collection.rs`) wraps the collecting flow: it accumulates each module's `HelperSet` and produces a helpers file tailored to the union of needs; `CollectionSession::new(&emitter).mutable(true)` carries the flag.
 
 Shared helpers in `emit/mod.rs`:
 
@@ -151,7 +157,7 @@ export const UserCreatedSchema = z.object({
 export type UserCreated = z.infer<typeof UserCreatedSchema>;
 ```
 
-**Spec compliance: 88.8%** (see [Spec Compliance](#spec-compliance))
+**Spec compliance: 100%** (see [Spec Compliance](#spec-compliance))
 
 | JSON Schema Feature                        | Zod Mapping                                                      |
 | ------------------------------------------ | ---------------------------------------------------------------- |
@@ -242,7 +248,7 @@ class UserCreated:
     age: Optional[int] = Field(ge=0, default=None)
 ```
 
-**Spec compliance: 89.7%** (see [Spec Compliance](#spec-compliance))
+**Spec compliance: 100%** (see [Spec Compliance](#spec-compliance))
 
 | SchemaIr          | Python Type                 | Constraint Mapping                             |
 | ----------------- | --------------------------- | ---------------------------------------------- |
@@ -373,6 +379,8 @@ When any field has constraints, a custom `init(from decoder:)` is generated that
 
 Complex compositions (`not`, `if`/`then`/`else`, `oneOf`, intersections, `patternProperties`, `dependent*`) are validated via generated wrapper types with custom `init(from:)` logic. Helper and `$defs` types are emitted file-private (or root-type-prefixed when they appear in public signatures) so many generated files can compile into a single module.
 
+**Re-validation:** every generated type conforms to a `Validatable` protocol (per-file prefixed in inline mode) with a default implementation that round-trips through the validating decoder: `validate() throws`, `isValid`, and `validatedJSONData()`. Typed structs also get a throwing memberwise initializer, and single-value wrappers get `init(_ value:) throws`, so manually constructed values are validated at creation. `--mutable` switches stored properties from `let` to `var`.
+
 ### Kotlin (`emit/kotlin.rs`)
 
 Generates `@Serializable data class` with `@SerialName` annotations for kotlinx.serialization.
@@ -420,6 +428,48 @@ data class UserCreated(
 
 **Validation:** Simple objects map to plain `@Serializable data class` (structure and required fields enforced by kotlinx). Schemas with constraints generate wrapper classes with custom `KSerializer` implementations performing the checks at decode time. Helper and `$defs` types are emitted file-private or root-type-prefixed so many generated files can compile into a single module.
 
+**Re-validation:** every generated class implements `_JstValidatable` — `validate()` (serializer round-trip, throws on invalid) and `toValidatedJson()`. Object-shaped wrappers get a typed companion `invoke` constructor. Constructors deliberately do not auto-validate (the deserializer invokes them; validating there would recurse). `--mutable` switches `val` → `var`.
+
+### Rust (`emit/rust/`)
+
+Generates serde structs whose `Deserialize` implementation validates at decode time: the input deserializes to a `serde_json::Value`, the schema's constraints are checked against the raw value, then typed fields are extracted. Generated code depends on `serde` (derive), `serde_json`, and `regex`.
+
+**Output example:**
+
+```rust
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct UserCreated {
+    pub email: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub age: Option<serde_json::Number>,
+}
+
+impl<'de> serde::Deserialize<'de> for UserCreated {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let v = serde_json::Value::deserialize(d)?;
+        Self::_jst_from_value(&v).map_err(serde::de::Error::custom)
+    }
+}
+```
+
+| SchemaIr                                                  | Rust Type                                                            |
+| --------------------------------------------------------- | -------------------------------------------------------------------- |
+| `String` / `Enum` (field)                                 | `String`                                                             |
+| `Number`                                                  | `f64`                                                                |
+| `Integer`                                                 | `serde_json::Number` (never rejects valid huge/`1.0`-style integers) |
+| `Boolean`                                                 | `bool`                                                               |
+| `Array`                                                   | `Vec<ItemType>`                                                      |
+| `Record`                                                  | `BTreeMap<String, ValueType>`                                        |
+| `Optional` / `Nullable`                                   | `Option<Type>` (never double-wrapped)                                |
+| `Object` (inline)                                         | nested generated struct                                              |
+| `Enum` (top-level def)                                    | Rust `enum` with `#[serde(rename)]`                                  |
+| `Ref` / `Lazy`                                            | referenced type, `Box<T>` when recursive                             |
+| `Null` / `Any` / `Unknown` / compositions / `Interpreted` | newtype over `serde_json::Value` with full validation                |
+
+**Validation:** every constraint is checked against the raw `Value` before typed extraction (required-vs-optional-vs-nullable by key presence, `additionalProperties`, `patternProperties`, `uniqueItems` via canonicalization, `oneOf` exclusivity, …), so accept/reject semantics are complete regardless of how rich the typed mapping is. Helper functions are `_jst_`-prefixed; in collection mode generated modules reference the shared `jst_helpers.rs` via `use super::…::jst_helpers::*;` with one `super` per directory level.
+
+**Re-validation:** the raw-value checks are exposed as a generated `_jst_check(&Value)` per type; `validate(&self)` re-serializes the value and re-runs them, and `to_validated_json(&self)` validates then serializes. Fields are `pub`, so `--mutable` is a documented no-op.
+
 ## Spec Compliance
 
 Measured against the official [JSON Schema Test Suite](https://github.com/json-schema-org/JSON-Schema-Test-Suite) (Draft 2020-12) — all 1,299 test cases, nothing skipped:
@@ -430,13 +480,14 @@ Measured against the official [JSON Schema Test Suite](https://github.com/json-s
 | **Pydantic** | 100% (1299/1299) |
 | **Swift**    | 100% (1299/1299) |
 | **Kotlin**   | 100% (1299/1299) |
+| **Rust**     | 100% (1299/1299) |
 | TypeScript   | N/A (no runtime) |
 
 Conformance is measured under the standard draft 2020-12 profile, where `format` is annotation-only. Format enforcement is this library's opt-in extension: on by default (`Converter::convert` / `convert_with_remotes`), disabled via `Converter::convert_with_options(schema, remotes, false)`.
 
 ### The interpreted fallback
 
-Most schemas compile to fully native validators. Keywords whose semantics require evaluation-annotation tracking or cross-document reference resolution cannot be expressed as composable per-keyword native validators — `unevaluatedProperties`/`unevaluatedItems`, `$dynamicRef`/`$dynamicAnchor`, `$anchor`, nested `$id` scopes, remote/non-fragment `$ref`s, `$ref: "#"`, custom `$schema` dialects (`$vocabulary`), and `__proto__` property names. The parser routes schemas using any of these to `SchemaIr::Interpreted`, and each emitter embeds the raw schema (plus any remote documents) alongside a self-contained draft 2020-12 mini-validator with full annotation tracking. The generated public type and API are unchanged; only the validation strategy inside differs. Reference implementation: `JSI_HELPER` in `emit/zod.rs`, with ports in `emit/pydantic.rs`, `emit/swift.rs`, and `emit/kotlin.rs`.
+Most schemas compile to fully native validators. Keywords whose semantics require evaluation-annotation tracking or cross-document reference resolution cannot be expressed as composable per-keyword native validators — `unevaluatedProperties`/`unevaluatedItems`, `$dynamicRef`/`$dynamicAnchor`, `$anchor`, nested `$id` scopes, remote/non-fragment `$ref`s, `$ref: "#"`, custom `$schema` dialects (`$vocabulary`), and `__proto__` property names. The parser routes schemas using any of these to `SchemaIr::Interpreted`, and each emitter embeds the raw schema (plus any remote documents) alongside a self-contained draft 2020-12 mini-validator with full annotation tracking. The generated public type and API are unchanged; only the validation strategy inside differs. Reference implementation: `JSI_HELPER` in `emit/zod.rs`, with ports in `emit/pydantic.rs`, `emit/swift.rs`, `emit/kotlin.rs`, and `emit/rust/jsi_validator.rs`.
 
 Remote `$ref`s resolve against a caller-supplied registry (`Converter::convert_with_remotes(schema, &uri_to_document_map)`); the conformance generator preloads the suite's `remotes/` directory and the official 2020-12 meta-schemas.
 

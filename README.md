@@ -2,13 +2,14 @@
 
 Transform JSON Schema (Draft 2020-12) into native types and validation schemas for multiple languages. A single Rust core parses any JSON Schema into a target-agnostic intermediate representation (`SchemaIr`), then pluggable emitters generate idiomatic code per language.
 
-| Emitter        | Output                                  | Runtime validation     | Conformance*         |
-| -------------- | --------------------------------------- | ---------------------- | -------------------- |
-| **Zod**        | Zod schemas + TypeScript types          | Yes (full)             | **100%** (1299/1299) |
-| **Pydantic**   | `@pydantic` dataclasses (Pydantic v2)   | Yes                    | **100%** (1299/1299) |
-| **Swift**      | `Codable` structs + validating wrappers | Yes (decode-time)      | **100%** (1299/1299) |
-| **Kotlin**     | `@Serializable` data classes            | Yes (decode-time)      | **100%** (1299/1299) |
-| **TypeScript** | Pure `.d.ts` type definitions           | No (compile-time only) | n/a                  |
+| Emitter        | Output                                   | Runtime validation     | Conformance*         |
+| -------------- | ---------------------------------------- | ---------------------- | -------------------- |
+| **Zod**        | Zod schemas + TypeScript types           | Yes (full)             | **100%** (1299/1299) |
+| **Pydantic**   | `@pydantic` dataclasses (Pydantic v2)    | Yes                    | **100%** (1299/1299) |
+| **Swift**      | `Codable` structs + validating wrappers  | Yes (decode-time)      | **100%** (1299/1299) |
+| **Kotlin**     | `@Serializable` data classes             | Yes (decode-time)      | **100%** (1299/1299) |
+| **Rust**       | serde structs + validating `Deserialize` | Yes (decode-time)      | **100%** (1299/1299) |
+| **TypeScript** | Pure `.d.ts` type definitions            | No (compile-time only) | n/a                  |
 
 \* The full official [JSON-Schema-Test-Suite](https://github.com/json-schema-org/JSON-Schema-Test-Suite) (draft 2020-12, 1,299 test cases — nothing skipped), measured under the standard draft 2020-12 profile where `format` is annotation-only. Format enforcement is this library's opt-in extension (on by default in the API/CLI; see `Converter::convert_with_options`).
 
@@ -22,7 +23,7 @@ crates/
   jst-cli/                   `jst` binary — convert schemas from the command line.
   conformance-gen/           Internal tool: generates conformance fixtures from the test suite.
 conformance/
-  ts/ python/ swift/ kotlin/ Native-language conformance harnesses (see Testing).
+  ts/ python/ swift/ kotlin/ rust/ Native-language conformance harnesses (see Testing).
   generated/                 Generated fixtures + manifest.json (regenerable, gitignored).
   results/                   Per-language results JSON (regenerable, gitignored).
 fixtures/
@@ -36,7 +37,7 @@ Emitters are opt-in features so downstream users only compile what they need:
 
 ```toml
 [dependencies]
-json-schema-transformer = { version = "0.1", features = ["zod", "swift"] }
+json-schema-transformer = { version = "0.2", features = ["zod", "swift"] }
 # or features = ["all-emitters"]
 ```
 
@@ -67,51 +68,79 @@ or build from source:
 cargo build --release -p jst-cli
 ```
 
-Usage:
+Usage — the CLI runs in one of two modes:
+
+**Single-file mode** (one schema → `--out` or stdout): the generated module is fully self-contained, with all runtime helpers inlined.
 
 ```bash
 # Single target to stdout
 jst schema.json --target zod
 
-# All targets into a directory
-jst schema.json --out-dir ./generated
+# To a specific file
+jst schema.json --target swift --out OrderItem.swift
 
 # From stdin, custom naming
 echo '{"type":"string"}' | jst - --target swift --name my-type
-
-# Shared helpers: utilities (validators, wrapper types) go to a separate
-# companion file instead of being inlined into each schema module
-jst schema.json --target zod --out-dir ./generated --helpers-file            # per-language default name
-jst schema.json --target zod --out-dir ./generated --helpers-file utils.ts   # custom name
 ```
 
-The generated root type name is the PascalCased name, resolved in order: `--name` argument, the schema's root `title`, then the input file's stem (library callers get `ConvertError::MissingName` instead of the file-stem fallback).
+**Collection mode** (`--out-dir`, multiple schemas, or a directory input): one output file per schema plus a shared helpers file at the output root containing exactly the union of helpers the emitted modules need — nothing more. Directory inputs are expanded recursively (`**/*.json`) and their structure is mirrored into the output directory; nested modules reference the root helpers file with depth-aware paths.
 
-By default every generated module is fully self-contained. With `--helpers-file` (library: `EmitOptions { helpers_file }` and `Emitter::helpers_content()`), shared utilities are emitted once into a companion file — `jst-helpers.ts` / `jst_helpers.py` / `JstHelpers.swift` / `JstHelpers.kt` — and schema modules reference them (imports in TypeScript/Python, same-module internal declarations in Swift/Kotlin). This keeps schema files free of utility noise and avoids duplicated declarations when many generated files are compiled together.
+```bash
+# All targets into a directory (single schema still gets a shared helpers file)
+jst schema.json --out-dir ./generated
+
+# Many schemas, mirrored tree:
+#   schemas/orders/item.json  → generated/orders/Item.zod.ts
+#   schemas/users/profile.json → generated/users/Profile.zod.ts
+#   + generated/jst-helpers.ts (tailored to what the modules use)
+jst schemas/ --target zod --out-dir ./generated
+
+# Mix files and directories; override the helpers file name (single target)
+jst extra.json schemas/ --target zod --out-dir ./generated --helpers-file utils.ts
+```
+
+The generated root type name is the PascalCased name, resolved in order: `--name` argument (single-file mode), the schema's root `title`, then the input file's stem (library callers get `ConvertError::MissingName` instead of the file-stem fallback). Collection-mode output file stems follow each language's convention: `snake_case` for Python, `PascalCase` otherwise.
+
+The shared helpers file — `jst-helpers.ts` / `jst_helpers.py` / `JstHelpers.swift` / `JstHelpers.kt` / `jst_helpers.rs` — is referenced via imports in TypeScript/Python, same-module internal declarations in Swift/Kotlin, and `use super::…::jst_helpers::*;` in Rust (mount the generated tree as a module hierarchy mirroring the directories, with `jst_helpers.rs` a sibling of the root-level files; generated Rust depends on `serde` + `serde_json` + `regex`). Library callers use `CollectionSession` (accumulates helper needs across `emit` calls, then `helpers()` yields the tailored file) or `Emitter::emit_collecting` / `Emitter::helpers_content_for` directly; `EmitOptions { helpers }` carries the helpers file name and the per-module directory prefix.
+
+### Re-validation and mutability
+
+Generated types validate at decode time, and every validating target also exposes an **explicit validation API** for values that are constructed or mutated in code rather than decoded:
+
+- **Swift** — every type conforms to a generated `Validatable` protocol: `try value.validate()`, `value.isValid`, and `try value.validatedJSONData()` (validate, then encode). Typed structs also get a throwing memberwise initializer (`try OrderItem(id: "a", quantity: 2)`) that rejects invalid values at construction.
+- **Kotlin** — every generated class implements `_JstValidatable` (`validate()` throws on invalid, `toValidatedJson()`), and object-shaped wrapper types get a typed companion constructor (`OrderItem(id = "a", quantity = 1)`).
+- **Rust** — every type has `validate(&self) -> Result<(), String>` and `to_validated_json(&self) -> Result<String, String>`; fields are `pub`, so construction and mutation are always possible.
+- **Pydantic** — dataclasses are mutable; with `--mutable`, `validate_assignment=True` is emitted so invalid attribute assignment raises immediately. Explicit re-validation: `TypeAdapter(OrderItem).validate_python(...)`.
+- **Zod** — parse outputs are plain objects; re-validate by re-running `OrderItemSchema.parse(value)`.
+
+`--mutable` switches stored properties from Swift `let` / Kotlin `val` to `var` (Rust, Python, and TypeScript outputs are already mutable, so it changes nothing there beyond the Pydantic config above). Validation APIs are emitted regardless of the flag.
+
+One caveat by design: **plain encoding does not validate** (`JSONEncoder().encode`, kotlinx `encodeToString`, serde serialization). `validate()` is implemented by round-tripping through the validating decoder, so hooking the raw encode path would recurse; use the `validatedJSONData()` / `toValidatedJson()` / `to_validated_json()` helpers when you need serialize-only-if-valid.
 
 ## Testing
 
 ```bash
 git submodule update --init  # first time: fetch the JSON Schema test suite
-bun scripts/test.ts          # build, unit, integration, fixtures, all 4 conformance suites (~50s)
+bun scripts/test.ts          # build, unit, integration, fixtures, all 5 conformance suites
 bun scripts/test.ts --quick  # build + unit tests only
 bun run test:integration     # per-harness integration tests only (jst CLI → generated code → native run)
 ```
 
-Each harness also has an integration test (`conformance/<lang>/integration.test.ts`) that drives the real `jst` CLI over a sample schema (name from `title`, shared-helpers mode) and executes the generated code natively, asserting accept/reject behavior.
+Each harness also has an integration test (`conformance/<lang>/integration.test.ts`) that drives the real `jst` CLI over a sample schema (name from `title`, collection mode) and executes the generated code natively, asserting accept/reject behavior.
 
 Conformance testing runs the full official test suite **natively in each output language** — each harness compiles/loads all 383 generated fixture modules once and executes all 1,299 cases in a single process:
 
-| Suite    | Command                         | Approx. time                       |
-| -------- | ------------------------------- | ---------------------------------- |
-| Zod      | `bun run conformance/ts/run.ts` | < 0.3s                             |
-| Pydantic | `conformance/python/run.sh`     | ~1s                                |
-| Swift    | `bun conformance/swift/run.ts`  | ~7s (one `swiftc` batch compile)   |
-| Kotlin   | `bun conformance/kotlin/run.ts` | ~25s (one `kotlinc` batch compile) |
+| Suite    | Command                         | Approx. time                                                             |
+| -------- | ------------------------------- | ------------------------------------------------------------------------ |
+| Zod      | `bun run conformance/ts/run.ts` | < 0.3s                                                                   |
+| Pydantic | `conformance/python/run.sh`     | ~1s                                                                      |
+| Swift    | `bun conformance/swift/run.ts`  | ~7s (one `swiftc` batch compile)                                         |
+| Kotlin   | `bun conformance/kotlin/run.ts` | ~25s (one `kotlinc` batch compile)                                       |
+| Rust     | `bun conformance/rust/run.ts`   | ~1min first run (cargo deps), then one incremental `cargo` batch compile |
 
 Fixtures are produced by `conformance-gen`, which walks `fixtures/JSON-Schema-Test-Suite/tests/draft2020-12`, converts every test group through every emitter, and writes `conformance/generated/manifest.json` describing each group (type name, generated file per language, expected validity per test). Generation errors are recorded in the manifest and counted as failures by the harnesses — no test is silently skipped.
 
-Requirements per harness: bun (Zod), python3 + venv (Pydantic — created automatically at `conformance/python/.venv`), swiftc (Swift), kotlinc + java (Kotlin — serialization jars vendored in `conformance/kotlin/libs/`).
+Requirements per harness: bun (Zod), python3 + venv (Pydantic — created automatically at `conformance/python/.venv`), swiftc (Swift), kotlinc + java (Kotlin — serialization jars vendored in `conformance/kotlin/libs/`), cargo (Rust — serde/serde_json/regex from crates.io, locked via `conformance/rust/Cargo.lock.template`).
 
 ## Architecture
 

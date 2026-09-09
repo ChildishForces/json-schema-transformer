@@ -1,9 +1,10 @@
-// Integration test: jst CLI → generated Zod module → runtime validation.
-// Covers title-based naming, shared-helpers mode, and inline mode.
-import { $ } from 'bun';
 import { beforeAll, describe, expect, test } from 'bun:test';
-import { mkdirSync, rmSync, writeFileSync } from 'fs';
+import { existsSync, mkdirSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
+
+// Integration test: jst CLI → generated Zod module → runtime validation.
+// Covers title-based naming, collection mode, and single-file (inline) mode.
+import { $ } from 'bun';
 
 const ROOT = new URL('../..', import.meta.url).pathname.replace(/\/$/, '');
 const JST = join(ROOT, 'target/debug/jst');
@@ -50,9 +51,9 @@ interface ZodLike {
 }
 
 describe('zod integration', () => {
-  test('shared-helpers mode validates correctly', async () => {
-    await runJst(['sample.json', '--target', 'zod', '-d', '.', '--helpers-file']);
-    const mod = (await import(join(TMP, 'Order Item.zod.ts'))) as Record<string, ZodLike>;
+  test('collection mode validates correctly', async () => {
+    await runJst(['sample.json', '--target', 'zod', '-d', '.']);
+    const mod = (await import(join(TMP, 'OrderItem.zod.ts'))) as Record<string, ZodLike>;
     const schema = mod['OrderItemSchema'];
     expect(schema).toBeDefined();
     for (const [payload, expected] of CASES) {
@@ -60,9 +61,42 @@ describe('zod integration', () => {
     }
   });
 
-  test('inline mode is self-contained and equivalent', async () => {
+  test('single-file mode is self-contained and equivalent', async () => {
     await runJst(['sample.json', '--target', 'zod', '--out', 'inline.zod.ts']);
     const mod = (await import(join(TMP, 'inline.zod.ts'))) as Record<string, ZodLike>;
+    const schema = mod['OrderItemSchema'];
+    expect(schema).toBeDefined();
+    for (const [payload, expected] of CASES) {
+      expect(schema!.safeParse(payload).success).toBe(expected);
+    }
+  });
+
+  test('collection mode mirrors directory structure with depth-aware imports', async () => {
+    mkdirSync(join(TMP, 'schemas/orders'), { recursive: true });
+    mkdirSync(join(TMP, 'schemas/users'), { recursive: true });
+    writeFileSync(join(TMP, 'schemas/orders/item.json'), JSON.stringify(SCHEMA));
+    writeFileSync(
+      join(TMP, 'schemas/users/profile.json'),
+      JSON.stringify({
+        title: 'User Profile',
+        type: 'object',
+        properties: { name: { type: 'string' } },
+      })
+    );
+    await runJst(['schemas', '--target', 'zod', '-d', 'gen']);
+
+    // Mirrored tree: schemas/orders/item.json → gen/orders/OrderItem.zod.ts
+    const nestedPath = join(TMP, 'gen/orders/OrderItem.zod.ts');
+    expect(existsSync(nestedPath)).toBe(true);
+    expect(existsSync(join(TMP, 'gen/users/UserProfile.zod.ts'))).toBe(true);
+
+    // Nested modules import the root helpers file with a depth-aware path
+    const nested = await Bun.file(nestedPath).text();
+    expect(nested).toContain('from "../jst-helpers"');
+    expect(existsSync(join(TMP, 'gen/jst-helpers.ts'))).toBe(true);
+
+    // And the nested module still validates end-to-end
+    const mod = (await import(nestedPath)) as Record<string, ZodLike>;
     const schema = mod['OrderItemSchema'];
     expect(schema).toBeDefined();
     for (const [payload, expected] of CASES) {

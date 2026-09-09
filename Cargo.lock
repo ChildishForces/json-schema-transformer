@@ -106,7 +106,7 @@ checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
 
 [[package]]
 name = "conformance-gen"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -159,7 +159,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "json-schema-transformer"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "indexmap",
  "serde_json",
@@ -168,7 +168,7 @@ dependencies = [
 
 [[package]]
 name = "jst-cli"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",

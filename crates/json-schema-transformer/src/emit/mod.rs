@@ -2,6 +2,8 @@
 pub mod kotlin;
 #[cfg(feature = "pydantic")]
 pub mod pydantic;
+#[cfg(feature = "rust")]
+pub mod rust;
 #[cfg(feature = "swift")]
 pub mod swift;
 #[cfg(feature = "typescript")]
@@ -11,17 +13,77 @@ pub mod zod;
 
 use crate::ir::ConvertedSchema;
 
+/// A set of helper-component keys a generated module needs. Keys are opaque,
+/// per-language identifiers defined by each emitter (e.g. "deep_equal",
+/// "email", "jsi"); [`Emitter::helpers_content_for`] maps a union of them
+/// back to a tailored shared-helpers file.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HelperSet(pub std::collections::BTreeSet<&'static str>);
+
+impl HelperSet {
+    pub fn insert(&mut self, key: &'static str) {
+        self.0.insert(key);
+    }
+
+    pub fn contains(&self, key: &str) -> bool {
+        self.0.contains(key)
+    }
+
+    pub fn union_with(&mut self, other: &HelperSet) {
+        self.0.extend(other.0.iter());
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
 /// Options controlling module emission.
 #[derive(Debug, Clone, Default)]
 pub struct EmitOptions {
-    /// When set, utility helpers (deep-equality, canonical stringify, the
-    /// spec-interpreter, format wrapper types, ...) are NOT emitted inline into
-    /// the module. The module instead references them from this companion file:
-    /// an import in TypeScript/Python, same-module internal declarations in
-    /// Swift/Kotlin. Generate the companion file once via
-    /// [`Emitter::helpers_content`]. The value is the helper file's name,
-    /// e.g. "jst-helpers.ts" (used to derive import paths where relevant).
-    pub helpers_file: Option<String>,
+    /// None → single-file mode: utility helpers (deep-equality, canonical
+    /// stringify, the spec-interpreter, format wrapper types, ...) are
+    /// inlined so the module is self-contained.
+    ///
+    /// Some → collection mode: helpers live in a shared companion file and
+    /// the module references them instead: an import in TypeScript/Python, a
+    /// `use` in Rust, same-module internal declarations in Swift/Kotlin.
+    /// Generate the companion file once via [`Emitter::helpers_content_for`]
+    /// with the union of needs reported by [`Emitter::emit_collecting`].
+    pub helpers: Option<SharedHelpers>,
+
+    /// Emit mutable stored properties (Swift `var` instead of `let`, Kotlin
+    /// `var` instead of `val`; Pydantic enables assignment re-validation).
+    /// Validation APIs (`validate()`, manual constructors) are emitted
+    /// regardless — this only affects field mutability. No-op for languages
+    /// whose output is already mutable (Rust, TypeScript/Zod).
+    pub mutable: bool,
+}
+
+/// Where the shared helpers file lives relative to a generated module.
+#[derive(Debug, Clone)]
+pub struct SharedHelpers {
+    /// Helper file name at the collection root, e.g. "jst-helpers.ts".
+    pub file_name: String,
+    /// Relative path prefix from the generated file's directory back to the
+    /// collection root: "" for root-level files, one "../" per nesting level.
+    /// Always ends with '/' when non-empty.
+    pub dir_prefix: String,
+}
+
+impl SharedHelpers {
+    pub fn new(file_name: impl Into<String>) -> Self {
+        Self {
+            file_name: file_name.into(),
+            dir_prefix: String::new(),
+        }
+    }
+
+    /// Number of directory levels between the generated file and the
+    /// collection root, derived from `dir_prefix`.
+    pub fn depth(&self) -> usize {
+        self.dir_prefix.matches("../").count()
+    }
 }
 
 /// Trait for emitting generated code from a converted JSON Schema.
@@ -43,8 +105,34 @@ pub trait Emitter {
         options: &EmitOptions,
     ) -> String;
 
-    /// Full content of this language's shared helpers file (static — identical
-    /// for every schema). None when the language emits no runtime helpers.
+    /// Collection mode: emit and report which shared-helper components this
+    /// module references. The default suits languages without runtime helpers.
+    fn emit_collecting(
+        &self,
+        converted: &ConvertedSchema,
+        name: &str,
+        options: &EmitOptions,
+    ) -> (String, HelperSet) {
+        (
+            self.emit_with_options(converted, name, options),
+            HelperSet::default(),
+        )
+    }
+
+    /// Shared helpers file tailored to exactly `needs` plus internal
+    /// dependencies (e.g. Kotlin's interpreter pulls in its equality helper).
+    /// None when `needs` is empty or the language emits no runtime helpers.
+    fn helpers_content_for(&self, needs: &HelperSet) -> Option<String> {
+        if needs.is_empty() {
+            None
+        } else {
+            self.helpers_content()
+        }
+    }
+
+    /// Full content of this language's shared helpers file (a superset of
+    /// every possible need). Fallback for [`Emitter::helpers_content_for`].
+    /// None when the language emits no runtime helpers.
     fn helpers_content(&self) -> Option<String> {
         None
     }
@@ -60,6 +148,8 @@ pub trait Emitter {
 pub use kotlin::KotlinEmitter;
 #[cfg(feature = "pydantic")]
 pub use pydantic::PydanticEmitter;
+#[cfg(feature = "rust")]
+pub use rust::RustEmitter;
 #[cfg(feature = "swift")]
 pub use swift::SwiftEmitter;
 #[cfg(feature = "typescript")]

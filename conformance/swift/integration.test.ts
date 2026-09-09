@@ -1,11 +1,14 @@
-// Integration test: jst CLI → generated Swift Codable + JstHelpers → compile
-// with swiftc → run decode assertions. Covers title-based naming and
-// shared-helpers mode. The checker program lives in
-// integration-main.template.swift.
-import { $ } from 'bun';
 import { beforeAll, describe, expect, test } from 'bun:test';
 import { copyFileSync, mkdirSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
+
+// Integration test: jst CLI → generated Swift Codable + JstHelpers → compile
+// with swiftc → run decode assertions. Covers title-based naming,
+// shared-helpers mode, manual throwing initializers, and --mutable output.
+// The checker programs live in integration-main.template.swift and
+// integration-mutation.template.swift (checkers must be named main.swift —
+// Swift only allows top-level statements there).
+import { $ } from 'bun';
 
 const ROOT = new URL('../..', import.meta.url).pathname.replace(/\/$/, '');
 const JST = join(ROOT, 'target/debug/jst');
@@ -33,27 +36,44 @@ beforeAll(async () => {
 });
 
 describe('swift integration', () => {
-  test(
-    'shared-helpers mode compiles and validates',
-    async () => {
-      const gen = await $`${JST} sample.json --target swift -d . --helpers-file`
+  test('collection mode compiles and validates', async () => {
+    const gen = await $`${JST} sample.json --target swift -d .`.cwd(TMP).quiet().nothrow();
+    if (gen.exitCode !== 0) throw new Error(`jst failed: ${gen.stderr.toString()}`);
+
+    const compile =
+      await $`swiftc -Onone -suppress-warnings OrderItem.swift JstHelpers.swift main.swift -o runner`
         .cwd(TMP)
         .quiet()
         .nothrow();
-      if (gen.exitCode !== 0) throw new Error(`jst failed: ${gen.stderr.toString()}`);
+    if (compile.exitCode !== 0) throw new Error(`swiftc failed: ${compile.stderr.toString()}`);
 
-      const compile =
-        await $`swiftc -Onone -suppress-warnings ${'Order Item.swift'} JstHelpers.swift main.swift -o runner`
-          .cwd(TMP)
-          .quiet()
-          .nothrow();
-      if (compile.exitCode !== 0) throw new Error(`swiftc failed: ${compile.stderr.toString()}`);
+    const run = await $`${join(TMP, 'runner')}`.quiet().nothrow();
+    const out = run.stdout.toString();
+    if (run.exitCode !== 0) throw new Error(`runner failed: ${run.stderr.toString()}\n${out}`);
+    expect(out.trim().split('\n').pop()).toBe('PASS');
+  }, 120_000);
 
-      const run = await $`${join(TMP, 'runner')}`.quiet().nothrow();
-      const out = run.stdout.toString();
-      if (run.exitCode !== 0) throw new Error(`runner failed: ${run.stderr.toString()}\n${out}`);
-      expect(out.trim().split('\n').pop()).toBe('PASS');
-    },
-    120_000
-  );
+  test('--mutable output allows mutation and re-validation', async () => {
+    const gen = await $`${JST} sample.json --target swift --mutable -d mut`
+      .cwd(TMP)
+      .quiet()
+      .nothrow();
+    if (gen.exitCode !== 0) throw new Error(`jst failed: ${gen.stderr.toString()}`);
+    copyFileSync(
+      join(import.meta.dir, 'integration-mutation.template.swift'),
+      join(TMP, 'mut', 'main.swift')
+    );
+
+    const compile =
+      await $`swiftc -Onone -suppress-warnings mut/OrderItem.swift mut/JstHelpers.swift mut/main.swift -o mutrunner`
+        .cwd(TMP)
+        .quiet()
+        .nothrow();
+    if (compile.exitCode !== 0) throw new Error(`swiftc failed: ${compile.stderr.toString()}`);
+
+    const run = await $`${join(TMP, 'mutrunner')}`.quiet().nothrow();
+    const out = run.stdout.toString();
+    if (run.exitCode !== 0) throw new Error(`mutrunner failed: ${run.stderr.toString()}\n${out}`);
+    expect(out.trim().split('\n').pop()).toBe('PASS');
+  }, 120_000);
 });

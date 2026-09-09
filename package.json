@@ -21,10 +21,11 @@
     "conformance:pydantic": "conformance/python/run.sh",
     "conformance:swift": "bun conformance/swift/run.ts",
     "conformance:kotlin": "bun conformance/kotlin/run.ts",
+    "conformance:rust": "bun conformance/rust/run.ts",
     "build": "cargo build --workspace --all-features",
     "build:release": "cargo build --workspace --all-features --release",
     "format": "oxfmt",
-    "test:integration": "bun test conformance/ts/integration.test.ts conformance/python/integration.test.ts conformance/swift/integration.test.ts conformance/kotlin/integration.test.ts"
+    "test:integration": "bun test conformance/ts/integration.test.ts conformance/python/integration.test.ts conformance/swift/integration.test.ts conformance/kotlin/integration.test.ts conformance/rust/integration.test.ts"
   },
   "devDependencies": {
     "@types/bun": "^1.4.0",

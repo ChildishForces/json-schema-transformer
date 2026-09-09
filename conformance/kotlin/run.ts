@@ -1,4 +1,7 @@
 #!/usr/bin/env bun
+import { existsSync, mkdirSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'fs';
+import { dirname, join, resolve } from 'path';
+
 /**
  * Kotlin conformance harness: generate Runner.kt from the manifest, compile
  * ALL generated fixtures + runner in ONE kotlinc invocation, run the whole
@@ -10,15 +13,6 @@
  * marked all-tests-failed with the compiler error as the reason).
  */
 import { $ } from 'bun';
-import {
-  existsSync,
-  mkdirSync,
-  readdirSync,
-  realpathSync,
-  rmSync,
-  writeFileSync,
-} from 'fs';
-import { dirname, join, resolve } from 'path';
 
 const HERE = import.meta.dir;
 const ROOT = resolve(HERE, '../..');
@@ -123,7 +117,8 @@ let lastLog = '';
 for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
   // 1. (Re)generate Runner.kt honouring current exclusions
   writeFileSync(EXCLUSIONS, JSON.stringify(exclusions, null, 2) + '\n');
-  const gen = await $`bun ${join(HERE, 'gen-runner.ts')} ${MANIFEST} ${EXCLUSIONS} ${join(BUILD, 'Runner.kt')}`.nothrow();
+  const gen =
+    await $`bun ${join(HERE, 'gen-runner.ts')} ${MANIFEST} ${EXCLUSIONS} ${join(BUILD, 'Runner.kt')}`.nothrow();
   if (gen.exitCode !== 0) process.exit(gen.exitCode);
 
   // 2. Collect sources minus excluded files
@@ -135,9 +130,10 @@ for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
   writeFileSync(srcList, sources.join('\n') + '\n');
 
   console.log(`[attempt ${attempt}] compiling ${sources.length} files...`);
-  const result = await $`${kotlinc} -nowarn -Xplugin=${SER_PLUGIN} -Xbackend-threads=0 -cp ${SER_JARS} -d ${CLASSES} @${srcList}`
-    .quiet()
-    .nothrow();
+  const result =
+    await $`${kotlinc} -nowarn -Xplugin=${SER_PLUGIN} -Xbackend-threads=0 -cp ${SER_JARS} -d ${CLASSES} @${srcList}`
+      .quiet()
+      .nothrow();
   lastLog = result.stdout.toString() + result.stderr.toString();
   writeFileSync(join(BUILD, 'kotlinc.log'), lastLog);
 
@@ -165,11 +161,14 @@ if (!compiled) {
 }
 
 const compileTime = ((Date.now() - compileStart) / 1000).toFixed(0);
-console.log(`compile OK in ${compileTime}s (excluded files: ${Object.keys(exclusions.files).length})`);
+console.log(
+  `compile OK in ${compileTime}s (excluded files: ${Object.keys(exclusions.files).length})`
+);
 
 // 4. Run the whole suite in one JVM
 const runStart = Date.now();
-const run = await $`java -cp ${[CLASSES, STDLIB, SER_JARS].join(':')} RunnerKt ${MANIFEST} ${RESULTS}`.nothrow();
+const run =
+  await $`java -cp ${[CLASSES, STDLIB, SER_JARS].join(':')} RunnerKt ${MANIFEST} ${RESULTS}`.nothrow();
 console.log(
   `compile time: ${compileTime}s, run time: ${((Date.now() - runStart) / 1000).toFixed(0)}s`
 );

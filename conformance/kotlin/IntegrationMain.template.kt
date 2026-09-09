@@ -25,5 +25,49 @@ fun main() {
             println("MISMATCH: " + payload + " expected=" + expected + " actual=" + actual)
         }
     }
+
+    // Typed construction is unvalidated by design; validate() /
+    // toValidatedJson() round-trip through the serializer explicitly.
+    val valid = OrderItem(id = "a", quantity = 1)
+    try {
+        valid.validate()
+    } catch (e: Exception) {
+        ok = false
+        println("MISMATCH: valid constructed instance failed validate(): " + e)
+    }
+    val validJson = try {
+        valid.toValidatedJson()
+    } catch (e: Exception) {
+        ok = false
+        println("MISMATCH: valid constructed instance failed toValidatedJson(): " + e)
+        ""
+    }
+    if (validJson.isNotEmpty() && !validJson.contains("\"quantity\"")) {
+        ok = false
+        println("MISMATCH: toValidatedJson() output missing quantity: " + validJson)
+    }
+
+    val invalid = OrderItem(id = "a", quantity = 0)
+    val invalidThrew = try {
+        invalid.validate()
+        false
+    } catch (e: Exception) {
+        true
+    }
+    if (!invalidThrew) {
+        ok = false
+        println("MISMATCH: invalid constructed instance passed validate()")
+    }
+    val invalidJsonThrew = try {
+        invalid.toValidatedJson()
+        false
+    } catch (e: Exception) {
+        true
+    }
+    if (!invalidJsonThrew) {
+        ok = false
+        println("MISMATCH: invalid constructed instance passed toValidatedJson()")
+    }
+
     println(if (ok) "PASS" else "FAIL")
 }
