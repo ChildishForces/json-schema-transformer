@@ -430,6 +430,21 @@ data class UserCreated(
 
 **Re-validation:** every generated class implements `_JstValidatable` — `validate()` (serializer round-trip, throws on invalid) and `toValidatedJson()`. Object-shaped wrappers get a typed companion `invoke` constructor. Constructors deliberately do not auto-validate (the deserializer invokes them; validating there would recurse). `--mutable` switches `val` → `var`.
 
+**Error reporting (complete issues):** wrapper serializers collect **every** failed constraint (Zod-style) and throw a single `JstValidationException` carrying `issues: List<JstIssue>` — each issue an RFC 6901 JSON-Pointer `path` (`""` = the whole value) and a `message` (`/quantity` → `must be >= 1`, `/tags/1` → `duplicate item`, `/extra` → `unexpected property`). The exception extends `kotlinx.serialization.SerializationException`, so existing catch sites keep working, and its `message` joins all issues `"; "`-separated:
+
+```kotlin
+try {
+    Json.decodeFromString<OrderItem>(payload)   // or value.validate() / value.toValidatedJson()
+} catch (e: JstValidationException) {
+    for ((path, message) in e.issues) println("$path: $message")
+    // /quantity: must be >= 1
+    // /tags/1: duplicate item
+    // /extra: unexpected property
+}
+```
+
+`required` reports every missing key, `uniqueItems` every duplicate index, and `$ref` delegation re-paths the referenced type's issues under the referencing location. Type mismatches short-circuit only their own subtree (no minLength complaints about a non-string); composition keywords (`anyOf`/`oneOf`) and the embedded draft 2020-12 interpreter report a single match/no-match verdict issue. Naming follows the helper convention: collection mode imports the public `JstIssue` / `JstValidationException` from `jst.helpers` (catch them by those names); single-file mode declares them per file as `_{RootType}JstIssue` / `_{RootType}JstValidationException` so many generated files compile into one module. Boundary rule: plain `@Serializable data class` shapes with no custom serializer keep kotlinx's native errors — there are no constraint checks to collect — but their `validate()` still surfaces `JstValidationException` when the round-trip hits a validating wrapper.
+
 ### Rust (`emit/rust/`)
 
 Generates serde structs whose `Deserialize` implementation validates at decode time: the input deserializes to a `serde_json::Value`, the schema's constraints are checked against the raw value, then typed fields are extracted. Generated code depends on `serde` (derive), `serde_json`, and `regex`.
@@ -468,7 +483,9 @@ impl<'de> serde::Deserialize<'de> for UserCreated {
 
 **Validation:** every constraint is checked against the raw `Value` before typed extraction (required-vs-optional-vs-nullable by key presence, `additionalProperties`, `patternProperties`, `uniqueItems` via canonicalization, `oneOf` exclusivity, …), so accept/reject semantics are complete regardless of how rich the typed mapping is. Helper functions are `_jst_`-prefixed; in collection mode generated modules reference the shared `jst_helpers.rs` via `use super::…::jst_helpers::*;` with one `super` per directory level.
 
-**Re-validation:** the raw-value checks are exposed as a generated `_jst_check(&Value)` per type; `validate(&self)` re-serializes the value and re-runs them, and `to_validated_json(&self)` validates then serializes. Fields are `pub`, so `--mutable` is a documented no-op.
+**Re-validation:** the raw-value checks are exposed as generated `_jst_collect`/`_jst_check` fns per type; `validate(&self)` re-serializes the value and re-runs them, and `to_validated_json(&self)` validates then serializes. Fields are `pub`, so `--mutable` is a documented no-op.
+
+**Error reporting:** validation failures return `JstError { issues: Vec<JstIssue> }` — the complete list of failed constraints (Zod-style), each with an RFC 6901 JSON-Pointer `path` and a `message` (e.g. `/quantity` → `must be >= 1`, `/tags/1` → `duplicate item`, `/extra` → `unexpected property`). Type mismatches short-circuit only their own subtree; composition keywords (`anyOf`/`oneOf`) report a single verdict issue. `Display` joins all issues, which is what serde decode errors surface.
 
 ## Spec Compliance
 

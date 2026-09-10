@@ -79,6 +79,12 @@ impl Emitter for SwiftEmitter {
             s.push_str(VALIDATABLE_HELPER);
             s.push('\n');
         }
+        // JstIssue/JstValidationError before the types that throw them
+        // (internal visibility, unlike the per-file private inline copies).
+        if helpers.needs_jst_error {
+            s.push_str(&strip_top_level_private(JST_ERROR_HELPER));
+            s.push('\n');
+        }
         // ValidationError with the union of cases the collection throws
         // (internal visibility, unlike the per-file private inline enum).
         if helpers.needs_any() {
@@ -140,6 +146,7 @@ impl Emitter for SwiftEmitter {
         let mut all = HelperSet::default();
         for n in [
             "validatable",
+            "jst_error",
             "email",
             "hostname",
             "ipv4",
@@ -241,6 +248,12 @@ impl SwiftEmitter {
         // conformance sites in the body.
         if helpers.needs_validatable {
             out.push_str(VALIDATABLE_HELPER);
+            out.push('\n');
+        }
+        // JstIssue/JstValidationError: file-private (top-level `private`), so
+        // many inline files can each carry a copy in one module.
+        if helpers.needs_jst_error {
+            out.push_str(JST_ERROR_HELPER);
             out.push('\n');
         }
         // Emit validation error enum if any validating types are used
@@ -350,6 +363,7 @@ fn strip_top_level_private(src: &str) -> String {
 #[derive(Default)]
 struct SwiftHelpers {
     needs_validatable: bool,
+    needs_jst_error: bool,
     needs_email: bool,
     needs_hostname: bool,
     needs_ipv4: bool,
@@ -369,6 +383,9 @@ impl SwiftHelpers {
         // Every generated struct/class/enum conforms; only typealias-only
         // modules skip the protocol.
         self.needs_validatable = body.contains("Validatable");
+        // Every issue-collecting (or single-verdict JstValidationError-
+        // throwing) init constructs a JstIssue.
+        self.needs_jst_error = body.contains("JstIssue");
         self.needs_email = body.contains("EmailAddress");
         self.needs_hostname = body.contains("HostnameString");
         self.needs_ipv4 = body.contains("IPv4Address");
@@ -385,8 +402,9 @@ impl SwiftHelpers {
 
     fn to_helper_set(&self) -> HelperSet {
         let mut needs = HelperSet::default();
-        let flags: [(&'static str, bool); 13] = [
+        let flags: [(&'static str, bool); 14] = [
             ("validatable", self.needs_validatable),
+            ("jst_error", self.needs_jst_error),
             ("email", self.needs_email),
             ("hostname", self.needs_hostname),
             ("ipv4", self.needs_ipv4),
@@ -411,6 +429,7 @@ impl SwiftHelpers {
     fn from_helper_set(needs: &HelperSet) -> SwiftHelpers {
         SwiftHelpers {
             needs_validatable: needs.contains("validatable"),
+            needs_jst_error: needs.contains("jst_error"),
             needs_email: needs.contains("email"),
             needs_hostname: needs.contains("hostname"),
             needs_ipv4: needs.contains("ipv4"),
@@ -495,6 +514,13 @@ impl SwiftHelpers {
 /// the validating decoder, plus `isValid` and `validatedJSONData()`.
 const VALIDATABLE_HELPER: &str = include_str!("validatable.swift");
 
+/// Zod-style complete-issues error: `JstIssue` (JSON-Pointer path + message),
+/// `JstValidationError` (the full list), and the pointer/error-translation
+/// helpers used by issue-collecting inits. Top-level `private` declarations
+/// (file-scoped) so inline files batch-compile; the shared helpers file
+/// strips the modifier.
+const JST_ERROR_HELPER: &str = include_str!("jst_error.swift");
+
 const EMAIL_ADDRESS_HELPER: &str = include_str!("email_address.swift");
 
 const HOSTNAME_HELPER: &str = include_str!("hostname_string.swift");
@@ -546,6 +572,12 @@ fn swift_escape(s: &str) -> String {
         })
         .collect();
     protect_helper_names(escaped)
+}
+
+/// Escape a literal key as a JSON Pointer token (RFC 6901: `~` → `~0`,
+/// `/` → `~1`) ready for embedding in a Swift string literal.
+fn ptr_escape(s: &str) -> String {
+    swift_escape(&s.replace('~', "~0").replace('/', "~1"))
 }
 
 /// The per-file helper-type rename (`SIGNATURE_HELPER_TYPES` loop in
@@ -641,7 +673,7 @@ fn emit_interpreted_root(
         let container = try decoder.singleValueContainer()
         let inst = try container.decode(JSIVal.self)
         guard let validator = Self._jsiValidator, validator.validate(inst) else {{
-            throw DecodingError.dataCorruptedError(in: container, debugDescription: "does not match schema")
+            throw JstValidationError(issues: [JstIssue(path: "", message: "does not match the schema (checked by the embedded draft 2020-12 validator)")])
         }}
         value = inst
     }}
@@ -759,14 +791,23 @@ fn emit_struct(name: &str, ir: &SchemaIr, defs: &[DefEntry]) -> String {
                 lines.push("    }".to_string());
             }
 
-            // Custom init(from:) for field validation and/or additionalProperties check
+            // Custom init(from:) for field validation and/or additionalProperties check.
+            // Issue-collecting (Zod-style): every field is decoded into a
+            // local first (a failure becomes issues, collection continues),
+            // all object-level checks push into `issues`, and a single
+            // JstValidationError carrying the complete list is thrown before
+            // the locals are assigned to the stored properties.
             if needs_custom_init {
                 // Leave a comment so the helper detector knows we need ValidationError
                 lines.push(String::new());
                 lines.push("    // @validate".to_string());
                 lines.push("    init(from decoder: Decoder) throws {".to_string());
+                lines.push("        var issues: [JstIssue] = []".to_string());
                 if !fields_info.is_empty() {
                     lines.push("        let container = try decoder.container(keyedBy: CodingKeys.self)".to_string());
+                    // Rebase for DecodingError coding paths: this init may run
+                    // nested inside a parent decode session.
+                    lines.push("        let _jstBase = decoder.codingPath.count".to_string());
                 }
 
                 // DynamicKey needed for key iteration (forbid_extra, patternProperties, AP schema, propertyNames, min/maxProperties, dependentRequired/Schemas)
@@ -783,35 +824,41 @@ fn emit_struct(name: &str, ir: &SchemaIr, defs: &[DefEntry]) -> String {
                     ));
                 }
 
-                // forbid_extra: reject unexpected keys
+                // forbid_extra: reject unexpected keys (every one is reported)
                 if forbid_extra && !has_pattern_props {
                     lines.push(
-                        "        for key in allKeysContainer.allKeys where !knownKeys.contains(key.stringValue) { throw ValidationError.outOfRange(key.stringValue, \"unexpected property\") }".to_string()
+                        "        for key in allKeysContainer.allKeys where !knownKeys.contains(key.stringValue) { issues.append(JstIssue(path: \"/\" + _jstPtr(key.stringValue), message: \"unexpected property\")) }".to_string()
                     );
                 }
 
-                // Decode fields
-                for (_, swift_name, swift_type, optional, guards) in &fields_info {
-                    if *optional {
-                        lines.push(format!(
-                            "        {swift_name} = try container.decodeIfPresent({swift_type}.self, forKey: .{swift_name})"
-                        ));
+                // Decode every field into a local (do/catch): one field's
+                // failure becomes issue(s) and collection continues. Missing
+                // required keys surface as keyNotFound per field, so ALL
+                // missing keys are reported, not just the first.
+                for (json_key, swift_name, swift_type, optional, guards) in &fields_info {
+                    let local = format!("_jst_{}", swift_name.trim_matches('`'));
+                    let ptr = format!("/{}", ptr_escape(json_key));
+                    lines.push(format!("        var {local}: {swift_type}? = nil"));
+                    let decode_call = if *optional {
+                        format!("try container.decodeIfPresent({swift_type}.self, forKey: .{swift_name})")
                     } else {
-                        lines.push(format!(
-                            "        {swift_name} = try container.decode({swift_type}.self, forKey: .{swift_name})"
-                        ));
-                    }
-                    emit_guard_lines(swift_name, *optional, guards, &mut lines);
+                        format!("try container.decode({swift_type}.self, forKey: .{swift_name})")
+                    };
+                    let raw_fallback = raw_array_guard_fallback(&ptr, swift_name, guards);
+                    lines.push(format!(
+                        "        do {{ {local} = {decode_call} }} catch {{ issues.append(contentsOf: _jstIssues(error, at: \"{ptr}\", containerBase: _jstBase)){raw_fallback} }}"
+                    ));
+                    emit_guard_collect_lines(&local, &ptr, guards, &mut lines);
                 }
 
                 // minProperties / maxProperties
                 if has_min_props || has_max_props {
                     lines.push("        let propCount = allKeysContainer.allKeys.count".to_string());
                     if let Some(min) = obj.min_properties {
-                        lines.push(format!("        if propCount < {min} {{ throw ValidationError.outOfRange(\"value\", \"minProperties\") }}"));
+                        lines.push(format!("        if propCount < {min} {{ issues.append(JstIssue(path: \"\", message: \"minProperties\")) }}"));
                     }
                     if let Some(max) = obj.max_properties {
-                        lines.push(format!("        if propCount > {max} {{ throw ValidationError.outOfRange(\"value\", \"maxProperties\") }}"));
+                        lines.push(format!("        if propCount > {max} {{ issues.append(JstIssue(path: \"\", message: \"maxProperties\")) }}"));
                     }
                 }
 
@@ -824,12 +871,12 @@ fn emit_struct(name: &str, ir: &SchemaIr, defs: &[DefEntry]) -> String {
                         let (pp_pre, pt) = emit_swift_sub_schema("PP", pp_schema, defs, &mut pp_c);
                         if !pp_pre.is_empty() { preamble.push_str(&pp_pre); }
                         lines.push(format!(
-                            "            if key.stringValue.range(of: \"{}\", options: .regularExpression) != nil {{ matched = true; let pv = try allKeysContainer.decode(AnyCodable.self, forKey: key); let pd = _serializeAny(pv.value); let _ = try JSONDecoder().decode({pt}.self, from: pd) }}",
+                            "            if key.stringValue.range(of: \"{}\", options: .regularExpression) != nil {{ matched = true; let pv = try allKeysContainer.decode(AnyCodable.self, forKey: key); let pd = _serializeAny(pv.value); do {{ let _ = try JSONDecoder().decode({pt}.self, from: pd) }} catch {{ issues.append(contentsOf: _jstIssues(error, at: \"/\" + _jstPtr(key.stringValue))) }} }}",
                             swift_escape(pattern)
                         ));
                     }
                     if forbid_extra {
-                        lines.push("            if !matched { throw ValidationError.outOfRange(key.stringValue, \"unexpected property\") }".to_string());
+                        lines.push("            if !matched { issues.append(JstIssue(path: \"/\" + _jstPtr(key.stringValue), message: \"unexpected property\")) }".to_string());
                     }
                     lines.push("        }".to_string());
                 } else if has_ap_schema {
@@ -839,7 +886,7 @@ fn emit_struct(name: &str, ir: &SchemaIr, defs: &[DefEntry]) -> String {
                         let (ap_pre, at) = emit_swift_sub_schema("AP", ap, defs, &mut ap_c);
                         if !ap_pre.is_empty() { preamble.push_str(&ap_pre); }
                         lines.push("        for key in allKeysContainer.allKeys where !knownKeys.contains(key.stringValue) {".to_string());
-                        lines.push(format!("            let av = try allKeysContainer.decode(AnyCodable.self, forKey: key); let ad = _serializeAny(av.value); let _ = try JSONDecoder().decode({at}.self, from: ad)"));
+                        lines.push(format!("            let av = try allKeysContainer.decode(AnyCodable.self, forKey: key); let ad = _serializeAny(av.value); do {{ let _ = try JSONDecoder().decode({at}.self, from: ad) }} catch {{ issues.append(contentsOf: _jstIssues(error, at: \"/\" + _jstPtr(key.stringValue))) }}"));
                         lines.push("        }".to_string());
                     }
                 }
@@ -855,7 +902,8 @@ fn emit_struct(name: &str, ir: &SchemaIr, defs: &[DefEntry]) -> String {
                     lines.push(format!("        if allKeysContainer.allKeys.contains(where: {{ $0.stringValue == \"{}\" }}) {{", trigger_key));
                     for r in required {
                         let rk = swift_escape(r);
-                        lines.push(format!("            if !allKeysContainer.allKeys.contains(where: {{ $0.stringValue == \"{rk}\" }}) {{ throw ValidationError.outOfRange(\"{rk}\", \"dependentRequired\") }}"));
+                        let rp = ptr_escape(r);
+                        lines.push(format!("            if !allKeysContainer.allKeys.contains(where: {{ $0.stringValue == \"{rk}\" }}) {{ issues.append(JstIssue(path: \"/{rp}\", message: \"dependentRequired\")) }}"));
                     }
                     lines.push("        }".to_string());
                 }
@@ -873,11 +921,25 @@ fn emit_struct(name: &str, ir: &SchemaIr, defs: &[DefEntry]) -> String {
                         }
                         let trigger_key = swift_escape(prop);
                         lines.push(format!("        if rawDict[\"{trigger_key}\"] != nil {{"));
-                        lines.push(format!("            let _ = try JSONDecoder().decode({dt}.self, from: rawData)"));
+                        // The dependent schema validates the whole object, so
+                        // its issues keep their own paths (prefix "").
+                        lines.push(format!("            do {{ let _ = try JSONDecoder().decode({dt}.self, from: rawData) }} catch {{ issues.append(contentsOf: _jstIssues(error, at: \"\")) }}"));
                         lines.push("        }".to_string());
                     }
                 }
 
+                // Throw the complete list, THEN assign locals to properties.
+                // Required fields with a failed decode have no value — the
+                // guaranteed-non-empty issues throw before the force unwrap.
+                lines.push("        if !issues.isEmpty { throw JstValidationError(issues: issues) }".to_string());
+                for (_, swift_name, _, optional, _) in &fields_info {
+                    let local = format!("_jst_{}", swift_name.trim_matches('`'));
+                    if *optional {
+                        lines.push(format!("        self.{swift_name} = {local}"));
+                    } else {
+                        lines.push(format!("        self.{swift_name} = {local}!"));
+                    }
+                }
                 lines.push("    }".to_string());
             }
 
@@ -940,7 +1002,7 @@ fn emit_struct(name: &str, ir: &SchemaIr, defs: &[DefEntry]) -> String {
         SchemaIr::Enum(cases) if cases.is_empty() => {
             // Empty enum — reject all values
             format!(
-                "struct {name}: Codable, Validatable {{\n    // @validate\n    init(from decoder: Decoder) throws {{\n        throw ValidationError.outOfRange(\"value\", \"schema rejects all values\")\n    }}\n    func encode(to encoder: Encoder) throws {{}}\n}}"
+                "struct {name}: Codable, Validatable {{\n    // @validate\n    init(from decoder: Decoder) throws {{\n        throw JstValidationError(issues: [JstIssue(path: \"\", message: \"schema rejects all values\")])\n    }}\n    func encode(to encoder: Encoder) throws {{}}\n}}"
             )
         }
 
@@ -1045,7 +1107,7 @@ fn emit_wrapper_struct(name: &str, ir: &SchemaIr, defs: &[DefEntry]) -> String {
         SchemaIr::Number(c) => emit_numeric_wrapper(name, "Double", c, false),
         SchemaIr::Boolean => {
             format!(
-                "struct {name}: Codable, Validatable {{\n    let value: Bool\n\n    // @validate\n    init(from decoder: Decoder) throws {{\n        let container = try decoder.singleValueContainer()\n        let raw = try container.decode(AnyCodable.self)\n        guard raw.value is Bool else {{\n            throw ValidationError.outOfRange(\"value\", \"expected boolean, got non-boolean\")\n        }}\n        value = raw.value as! Bool\n    }}\n\n    func encode(to encoder: Encoder) throws {{\n        var container = encoder.singleValueContainer()\n        try container.encode(value)\n    }}\n}}"
+                "struct {name}: Codable, Validatable {{\n    let value: Bool\n\n    // @validate\n    init(from decoder: Decoder) throws {{\n        let container = try decoder.singleValueContainer()\n        let raw = try container.decode(AnyCodable.self)\n        guard raw.value is Bool else {{\n            throw JstValidationError(issues: [JstIssue(path: \"\", message: \"expected boolean, got non-boolean\")])\n        }}\n        value = raw.value as! Bool\n    }}\n\n    func encode(to encoder: Encoder) throws {{\n        var container = encoder.singleValueContainer()\n        try container.encode(value)\n    }}\n}}"
             )
         }
         SchemaIr::String(c) => emit_string_wrapper(name, c),
@@ -1057,12 +1119,12 @@ fn emit_wrapper_struct(name: &str, ir: &SchemaIr, defs: &[DefEntry]) -> String {
         SchemaIr::ComplexEnum(vals) => emit_complex_enum_wrapper(name, vals),
         SchemaIr::Null => {
             format!(
-                "struct {name}: Codable, Validatable {{\n    let value: AnyCodable\n\n    // @validate\n    init(from decoder: Decoder) throws {{\n        let container = try decoder.singleValueContainer()\n        let raw = try container.decode(AnyCodable.self)\n        guard raw.value is NSNull else {{ throw ValidationError.outOfRange(\"value\", \"expected null\") }}\n        value = raw\n    }}\n\n    func encode(to encoder: Encoder) throws {{\n        var container = encoder.singleValueContainer()\n        try container.encode(value)\n    }}\n}}"
+                "struct {name}: Codable, Validatable {{\n    let value: AnyCodable\n\n    // @validate\n    init(from decoder: Decoder) throws {{\n        let container = try decoder.singleValueContainer()\n        let raw = try container.decode(AnyCodable.self)\n        guard raw.value is NSNull else {{ throw JstValidationError(issues: [JstIssue(path: \"\", message: \"expected null\")]) }}\n        value = raw\n    }}\n\n    func encode(to encoder: Encoder) throws {{\n        var container = encoder.singleValueContainer()\n        try container.encode(value)\n    }}\n}}"
             )
         }
         SchemaIr::Never => {
             format!(
-                "struct {name}: Codable, Validatable {{\n    // @validate\n    init(from decoder: Decoder) throws {{\n        throw ValidationError.outOfRange(\"value\", \"schema rejects all values\")\n    }}\n    func encode(to encoder: Encoder) throws {{}}\n}}"
+                "struct {name}: Codable, Validatable {{\n    // @validate\n    init(from decoder: Decoder) throws {{\n        throw JstValidationError(issues: [JstIssue(path: \"\", message: \"schema rejects all values\")])\n    }}\n    func encode(to encoder: Encoder) throws {{}}\n}}"
             )
         }
         SchemaIr::Not { base, not_schema } => emit_not_wrapper(name, base, not_schema, defs),
@@ -1084,7 +1146,7 @@ fn emit_wrapper_struct(name: &str, ir: &SchemaIr, defs: &[DefEntry]) -> String {
         SchemaIr::Tuple(tuple) => emit_tuple_wrapper(name, tuple, defs),
         SchemaIr::Enum(cases) if cases.is_empty() => {
             format!(
-                "struct {name}: Codable, Validatable {{\n    // @validate\n    init(from decoder: Decoder) throws {{\n        throw ValidationError.outOfRange(\"value\", \"schema rejects all values\")\n    }}\n    func encode(to encoder: Encoder) throws {{}}\n}}"
+                "struct {name}: Codable, Validatable {{\n    // @validate\n    init(from decoder: Decoder) throws {{\n        throw JstValidationError(issues: [JstIssue(path: \"\", message: \"schema rejects all values\")])\n    }}\n    func encode(to encoder: Encoder) throws {{}}\n}}"
             )
         }
         SchemaIr::Enum(_) => return emit_struct(name, inner, defs),
@@ -1103,51 +1165,54 @@ fn unwrap_modifiers(ir: &SchemaIr) -> &SchemaIr {
 }
 
 fn emit_numeric_wrapper(name: &str, swift_ty: &str, c: &NumberConstraints, is_int: bool) -> String {
+    // Type coercion first: a type mismatch short-circuits its own subtree
+    // (range checks on a non-number are meaningless), so these throw a
+    // single-issue error immediately.
     let mut guards = Vec::new();
     if is_int {
-        guards.push(format!(
-            "        guard !(raw.value is Bool) else {{ throw ValidationError.outOfRange(\"value\", \"boolean is not {}\")}}", if is_int { "an integer" } else { "a number" }
-        ));
+        guards.push(
+            "        guard !(raw.value is Bool) else { throw JstValidationError(issues: [JstIssue(path: \"\", message: \"boolean is not an integer\")]) }".to_string()
+        );
         // Accept Int or Double (if whole number) for integer type
         guards.push(format!(
-            "        if let i = raw.value as? Int {{ value = i }} else if let d = raw.value as? Double, d == d.rounded(.towardZero), d >= Double(Int.min), d <= Double(Int.max) {{ value = Int(d) }} else {{ throw ValidationError.outOfRange(\"value\", \"expected {swift_ty}\") }}"
+            "        if let i = raw.value as? Int {{ value = i }} else if let d = raw.value as? Double, d == d.rounded(.towardZero), d >= Double(Int.min), d <= Double(Int.max) {{ value = Int(d) }} else {{ throw JstValidationError(issues: [JstIssue(path: \"\", message: \"expected {swift_ty}\")]) }}"
         ));
     } else {
+        guards.push(
+            "        guard !(raw.value is Bool) else { throw JstValidationError(issues: [JstIssue(path: \"\", message: \"boolean is not a number\")]) }".to_string()
+        );
         guards.push(format!(
-            "        guard !(raw.value is Bool) else {{ throw ValidationError.outOfRange(\"value\", \"boolean is not a number\")}}"
-        ));
-        guards.push(format!(
-            "        if let d = raw.value as? Double {{ value = d }} else if let i = raw.value as? Int {{ value = Double(i) }} else {{ throw ValidationError.outOfRange(\"value\", \"expected {swift_ty}\") }}"
+            "        if let d = raw.value as? Double {{ value = d }} else if let i = raw.value as? Int {{ value = Double(i) }} else {{ throw JstValidationError(issues: [JstIssue(path: \"\", message: \"expected {swift_ty}\")]) }}"
         ));
     }
-    // Numeric constraint guards
+    // Numeric constraints: same checks as before, but every failure is
+    // collected and thrown as one complete-issues error.
+    let mut checks = Vec::new();
     if let Some(v) = c.minimum {
         let b = format_number(v);
-        guards.push(format!("        if !(value >= {b}) {{ throw ValidationError.outOfRange(\"value\", \">= {b}\") }}"));
+        checks.push(format!("        if !(value >= {b}) {{ issues.append(JstIssue(path: \"\", message: \">= {b}\")) }}"));
     }
     if let Some(v) = c.maximum {
         let b = format_number(v);
-        guards.push(format!("        if !(value <= {b}) {{ throw ValidationError.outOfRange(\"value\", \"<= {b}\") }}"));
+        checks.push(format!("        if !(value <= {b}) {{ issues.append(JstIssue(path: \"\", message: \"<= {b}\")) }}"));
     }
     if let Some(v) = c.exclusive_minimum {
         let b = format_number(v);
-        guards.push(format!("        if !(value > {b}) {{ throw ValidationError.outOfRange(\"value\", \"> {b}\") }}"));
+        checks.push(format!("        if !(value > {b}) {{ issues.append(JstIssue(path: \"\", message: \"> {b}\")) }}"));
     }
     if let Some(v) = c.exclusive_maximum {
         let b = format_number(v);
-        guards.push(format!("        if !(value < {b}) {{ throw ValidationError.outOfRange(\"value\", \"< {b}\") }}"));
+        checks.push(format!("        if !(value < {b}) {{ issues.append(JstIssue(path: \"\", message: \"< {b}\")) }}"));
     }
     if let Some(v) = c.multiple_of {
         let b = format_number(v);
-        if is_int {
-            guards.push(format!("        if (Double(value) / {b}).isInfinite {{ throw ValidationError.outOfRange(\"value\", \"must be a multiple of {b}\") }}"));
-            guards.push(format!("        let _mof = Double(value).remainder(dividingBy: {b})"));
-            guards.push(format!("        if _mof.isNaN || _mof.isInfinite || (abs(_mof) > 1e-9 && abs(abs(_mof) - {b}) > 1e-9) {{ throw ValidationError.outOfRange(\"value\", \"must be a multiple of {b}\") }}"));
-        } else {
-            guards.push(format!("        if (value / {b}).isInfinite {{ throw ValidationError.outOfRange(\"value\", \"must be a multiple of {b}\") }}"));
-            guards.push(format!("        let _mof = value.remainder(dividingBy: {b})"));
-            guards.push(format!("        if _mof.isNaN || _mof.isInfinite || (abs(_mof) > 1e-9 && abs(abs(_mof) - {b}) > 1e-9) {{ throw ValidationError.outOfRange(\"value\", \"must be a multiple of {b}\") }}"));
-        }
+        let expr = if is_int { "Double(value)" } else { "value" };
+        checks.push(format!("        if ({expr} / {b}).isInfinite {{ issues.append(JstIssue(path: \"\", message: \"must be a multiple of {b}\")) }} else {{ let _mof = {expr}.remainder(dividingBy: {b}); if _mof.isNaN || _mof.isInfinite || (abs(_mof) > 1e-9 && abs(abs(_mof) - {b}) > 1e-9) {{ issues.append(JstIssue(path: \"\", message: \"must be a multiple of {b}\")) }} }}"));
+    }
+    if !checks.is_empty() {
+        guards.push("        var issues: [JstIssue] = []".to_string());
+        guards.extend(checks);
+        guards.push("        if !issues.isEmpty { throw JstValidationError(issues: issues) }".to_string());
     }
 
     format!(
@@ -1157,75 +1222,90 @@ fn emit_numeric_wrapper(name: &str, swift_ty: &str, c: &NumberConstraints, is_in
 }
 
 fn emit_string_wrapper(name: &str, c: &StringConstraints) -> String {
-    let mut guards = Vec::new();
+    // Same checks as before, all collected: minLength AND pattern failures
+    // are both reported.
+    let mut checks = Vec::new();
     if let Some(min) = c.min_length {
-        guards.push(format!("        if value.count < {min} {{ throw ValidationError.outOfRange(\"value\", \"length must be >= {min}\") }}"));
+        checks.push(format!("        if value.count < {min} {{ issues.append(JstIssue(path: \"\", message: \"length must be >= {min}\")) }}"));
     }
     if let Some(max) = c.max_length {
-        guards.push(format!("        if value.count > {max} {{ throw ValidationError.outOfRange(\"value\", \"length must be <= {max}\") }}"));
+        checks.push(format!("        if value.count > {max} {{ issues.append(JstIssue(path: \"\", message: \"length must be <= {max}\")) }}"));
     }
     if let Some(ref pat) = c.pattern {
         let escaped = swift_escape(pat);
-        guards.push(format!("        if value.range(of: \"{escaped}\", options: .regularExpression) == nil {{ throw ValidationError.outOfRange(\"value\", \"must match pattern\") }}"));
+        checks.push(format!("        if value.range(of: \"{escaped}\", options: .regularExpression) == nil {{ issues.append(JstIssue(path: \"\", message: \"must match pattern\")) }}"));
     }
+    let guards = collect_block(checks);
 
     format!(
-        "struct {name}: Codable, Validatable {{\n    let value: String\n\n    // @validate\n    init(from decoder: Decoder) throws {{\n        let container = try decoder.singleValueContainer()\n        value = try container.decode(String.self)\n{}\n    }}\n\n    func encode(to encoder: Encoder) throws {{\n        var container = encoder.singleValueContainer()\n        try container.encode(value)\n    }}\n}}",
-        guards.join("\n")
+        "struct {name}: Codable, Validatable {{\n    let value: String\n\n    // @validate\n    init(from decoder: Decoder) throws {{\n        let container = try decoder.singleValueContainer()\n        value = try container.decode(String.self)\n{guards}\n    }}\n\n    func encode(to encoder: Encoder) throws {{\n        var container = encoder.singleValueContainer()\n        try container.encode(value)\n    }}\n}}"
+    )
+}
+
+/// Wrap collected check statements with the `issues` declaration and the
+/// final complete-issues throw. Empty checks emit nothing.
+fn collect_block(checks: Vec<String>) -> String {
+    if checks.is_empty() {
+        return String::new();
+    }
+    format!(
+        "        var issues: [JstIssue] = []\n{}\n        if !issues.isEmpty {{ throw JstValidationError(issues: issues) }}",
+        checks.join("\n")
     )
 }
 
 fn emit_array_wrapper(name: &str, arr: &ArraySchema, defs: &[DefEntry]) -> String {
-    let mut guards = Vec::new();
+    let mut checks = Vec::new();
     let mut preamble = String::new();
 
     if let Some(min) = arr.min_items {
-        guards.push(format!("        if value.count < {min} {{ throw ValidationError.outOfRange(\"value\", \"must have at least {min} items\") }}"));
+        checks.push(format!("        if value.count < {min} {{ issues.append(JstIssue(path: \"\", message: \"must have at least {min} items\")) }}"));
     }
     if let Some(max) = arr.max_items {
-        guards.push(format!("        if value.count > {max} {{ throw ValidationError.outOfRange(\"value\", \"must have at most {max} items\") }}"));
+        checks.push(format!("        if value.count > {max} {{ issues.append(JstIssue(path: \"\", message: \"must have at most {max} items\")) }}"));
     }
 
-    // Item type validation (if items is not Any)
+    // Item type validation (if items is not Any) — every failing item gets
+    // its own index-pathed issue(s)
     if !matches!(arr.items.as_ref(), SchemaIr::Any) {
         let mut item_counter = 0usize;
         let (item_pre, item_type) = emit_swift_sub_schema("Item", &arr.items, defs, &mut item_counter);
         if !item_pre.is_empty() { preamble.push_str(&item_pre); }
-        guards.push(format!(
-            "        for (i, item) in value.enumerated() {{ let data = _serializeAny(item.value); let _ = try JSONDecoder().decode({item_type}.self, from: data) }}"
+        checks.push(format!(
+            "        for (i, item) in value.enumerated() {{ let data = _serializeAny(item.value); do {{ let _ = try JSONDecoder().decode({item_type}.self, from: data) }} catch {{ issues.append(contentsOf: _jstIssues(error, at: \"/\\(i)\")) }} }}"
         ));
     }
 
-    // UniqueItems
+    // UniqueItems — each duplicate index is reported
     if arr.unique_items {
-        guards.push(
-            "        let serialized = try value.map { try String(data: _serializeAny($0.value), encoding: .utf8) ?? \"\" }\n        if Set(serialized).count != value.count { throw ValidationError.outOfRange(\"value\", \"items must be unique\") }"
+        checks.push(
+            "        let serialized = try value.map { try String(data: _serializeAny($0.value), encoding: .utf8) ?? \"\" }\n        var _jstSeen = Set<String>()\n        for (i, s) in serialized.enumerated() { if !_jstSeen.insert(s).inserted { issues.append(JstIssue(path: \"/\\(i)\", message: \"items must be unique\")) } }"
                 .to_string(),
         );
     }
 
-    // Contains
+    // Contains (verdict-only: a match count, not a per-item property)
     if let Some(contains) = &arr.contains {
         let mut con_counter = 0usize;
         let (con_pre, contains_type) = emit_swift_sub_schema("Con", &contains.schema, defs, &mut con_counter);
         if !con_pre.is_empty() { preamble.push_str(&con_pre); }
         let min = contains.min_contains.unwrap_or(1);
-        guards.push(format!(
+        checks.push(format!(
             "        let matchCount = value.filter {{ item in (try? JSONDecoder().decode({contains_type}.self, from: _serializeAny(item.value))) != nil }}.count"
         ));
-        guards.push(format!(
-            "        if matchCount < {min} {{ throw ValidationError.outOfRange(\"value\", \"must contain at least {min} matching items\") }}"
+        checks.push(format!(
+            "        if matchCount < {min} {{ issues.append(JstIssue(path: \"\", message: \"must contain at least {min} matching items\")) }}"
         ));
         if let Some(max) = contains.max_contains {
-            guards.push(format!(
-                "        if matchCount > {max} {{ throw ValidationError.outOfRange(\"value\", \"must contain at most {max} matching items\") }}"
+            checks.push(format!(
+                "        if matchCount > {max} {{ issues.append(JstIssue(path: \"\", message: \"must contain at most {max} matching items\")) }}"
             ));
         }
     }
 
+    let guards = collect_block(checks);
     let body = format!(
-        "struct {name}: Codable, Validatable {{\n    let value: [AnyCodable]\n\n    // @validate\n    init(from decoder: Decoder) throws {{\n        let container = try decoder.singleValueContainer()\n        value = try container.decode([AnyCodable].self)\n{}\n    }}\n\n    func encode(to encoder: Encoder) throws {{\n        var container = encoder.singleValueContainer()\n        try container.encode(value)\n    }}\n}}",
-        guards.join("\n")
+        "struct {name}: Codable, Validatable {{\n    let value: [AnyCodable]\n\n    // @validate\n    init(from decoder: Decoder) throws {{\n        let container = try decoder.singleValueContainer()\n        value = try container.decode([AnyCodable].self)\n{guards}\n    }}\n\n    func encode(to encoder: Encoder) throws {{\n        var container = encoder.singleValueContainer()\n        try container.encode(value)\n    }}\n}}"
     );
     format!("{preamble}{body}")
 }
@@ -1235,7 +1315,7 @@ fn emit_array_wrapper(name: &str, arr: &ArraySchema, defs: &[DefEntry]) -> Strin
 /// the rest items via JSON round-trips.
 fn emit_tuple_wrapper(name: &str, tuple: &TupleSchema, defs: &[DefEntry]) -> String {
     let mut preamble = String::new();
-    let mut guards = Vec::new();
+    let mut checks = Vec::new();
     let prefix_count = tuple.items.len();
 
     for (i, item) in tuple.items.iter().enumerate() {
@@ -1247,16 +1327,16 @@ fn emit_tuple_wrapper(name: &str, tuple: &TupleSchema, defs: &[DefEntry]) -> Str
         if !pre.is_empty() {
             preamble.push_str(&pre);
         }
-        guards.push(format!(
-            "        if value.count > {i} {{ let td = _serializeAny(value[{i}].value); let _ = try JSONDecoder().decode({it}.self, from: td) }}"
+        checks.push(format!(
+            "        if value.count > {i} {{ let td = _serializeAny(value[{i}].value); do {{ let _ = try JSONDecoder().decode({it}.self, from: td) }} catch {{ issues.append(contentsOf: _jstIssues(error, at: \"/{i}\")) }} }}"
         ));
     }
 
     match &tuple.rest {
         None => {
             // items: false — no additional items beyond the prefix
-            guards.push(format!(
-                "        if value.count > {prefix_count} {{ throw ValidationError.outOfRange(\"value\", \"must have at most {prefix_count} items\") }}"
+            checks.push(format!(
+                "        if value.count > {prefix_count} {{ issues.append(JstIssue(path: \"\", message: \"must have at most {prefix_count} items\")) }}"
             ));
         }
         Some(rest) => {
@@ -1266,22 +1346,22 @@ fn emit_tuple_wrapper(name: &str, tuple: &TupleSchema, defs: &[DefEntry]) -> Str
                 if !pre.is_empty() {
                     preamble.push_str(&pre);
                 }
-                guards.push(format!(
-                    "        if value.count > {prefix_count} {{ for ri in {prefix_count}..<value.count {{ let rd = _serializeAny(value[ri].value); let _ = try JSONDecoder().decode({rt}.self, from: rd) }} }}"
+                checks.push(format!(
+                    "        if value.count > {prefix_count} {{ for ri in {prefix_count}..<value.count {{ let rd = _serializeAny(value[ri].value); do {{ let _ = try JSONDecoder().decode({rt}.self, from: rd) }} catch {{ issues.append(contentsOf: _jstIssues(error, at: \"/\\(ri)\")) }} }} }}"
                 ));
             }
         }
     }
 
     if let Some(min) = tuple.min_items {
-        guards.push(format!("        if value.count < {min} {{ throw ValidationError.outOfRange(\"value\", \"must have at least {min} items\") }}"));
+        checks.push(format!("        if value.count < {min} {{ issues.append(JstIssue(path: \"\", message: \"must have at least {min} items\")) }}"));
     }
     if let Some(max) = tuple.max_items {
-        guards.push(format!("        if value.count > {max} {{ throw ValidationError.outOfRange(\"value\", \"must have at most {max} items\") }}"));
+        checks.push(format!("        if value.count > {max} {{ issues.append(JstIssue(path: \"\", message: \"must have at most {max} items\")) }}"));
     }
     if tuple.unique_items {
-        guards.push(
-            "        let serialized = try value.map { try String(data: _serializeAny($0.value), encoding: .utf8) ?? \"\" }\n        if Set(serialized).count != value.count { throw ValidationError.outOfRange(\"value\", \"items must be unique\") }"
+        checks.push(
+            "        let serialized = try value.map { try String(data: _serializeAny($0.value), encoding: .utf8) ?? \"\" }\n        var _jstSeen = Set<String>()\n        for (i, s) in serialized.enumerated() { if !_jstSeen.insert(s).inserted { issues.append(JstIssue(path: \"/\\(i)\", message: \"items must be unique\")) } }"
                 .to_string(),
         );
     }
@@ -1292,22 +1372,22 @@ fn emit_tuple_wrapper(name: &str, tuple: &TupleSchema, defs: &[DefEntry]) -> Str
             preamble.push_str(&pre);
         }
         let min = contains.min_contains.unwrap_or(1);
-        guards.push(format!(
+        checks.push(format!(
             "        let matchCount = value.filter {{ item in (try? JSONDecoder().decode({contains_type}.self, from: _serializeAny(item.value))) != nil }}.count"
         ));
-        guards.push(format!(
-            "        if matchCount < {min} {{ throw ValidationError.outOfRange(\"value\", \"must contain at least {min} matching items\") }}"
+        checks.push(format!(
+            "        if matchCount < {min} {{ issues.append(JstIssue(path: \"\", message: \"must contain at least {min} matching items\")) }}"
         ));
         if let Some(max) = contains.max_contains {
-            guards.push(format!(
-                "        if matchCount > {max} {{ throw ValidationError.outOfRange(\"value\", \"must contain at most {max} matching items\") }}"
+            checks.push(format!(
+                "        if matchCount > {max} {{ issues.append(JstIssue(path: \"\", message: \"must contain at most {max} matching items\")) }}"
             ));
         }
     }
 
+    let guards = collect_block(checks);
     let body = format!(
-        "struct {name}: Codable, Validatable {{\n    let value: [AnyCodable]\n\n    // @validate\n    init(from decoder: Decoder) throws {{\n        let container = try decoder.singleValueContainer()\n        value = try container.decode([AnyCodable].self)\n{}\n    }}\n\n    func encode(to encoder: Encoder) throws {{\n        var container = encoder.singleValueContainer()\n        try container.encode(value)\n    }}\n}}",
-        guards.join("\n")
+        "struct {name}: Codable, Validatable {{\n    let value: [AnyCodable]\n\n    // @validate\n    init(from decoder: Decoder) throws {{\n        let container = try decoder.singleValueContainer()\n        value = try container.decode([AnyCodable].self)\n{guards}\n    }}\n\n    func encode(to encoder: Encoder) throws {{\n        var container = encoder.singleValueContainer()\n        try container.encode(value)\n    }}\n}}"
     );
     format!("{preamble}{body}")
 }
@@ -1322,14 +1402,14 @@ fn emit_type_guarded_wrapper(name: &str, guards: &[(TypeGuard, Box<SchemaIr>)], 
                 if let SchemaIr::String(c) = schema.as_ref() {
                     checks.push("        if let s = raw.value as? String {".to_string());
                     if let Some(min) = c.min_length {
-                        checks.push(format!("            if s.count < {min} {{ throw ValidationError.outOfRange(\"value\", \"minLength\") }}"));
+                        checks.push(format!("            if s.count < {min} {{ issues.append(JstIssue(path: \"\", message: \"minLength\")) }}"));
                     }
                     if let Some(max) = c.max_length {
-                        checks.push(format!("            if s.count > {max} {{ throw ValidationError.outOfRange(\"value\", \"maxLength\") }}"));
+                        checks.push(format!("            if s.count > {max} {{ issues.append(JstIssue(path: \"\", message: \"maxLength\")) }}"));
                     }
                     if let Some(ref pat) = c.pattern {
                         let escaped = swift_escape(pat);
-                        checks.push(format!("            if s.range(of: \"{escaped}\", options: .regularExpression) == nil {{ throw ValidationError.outOfRange(\"value\", \"pattern\") }}"));
+                        checks.push(format!("            if s.range(of: \"{escaped}\", options: .regularExpression) == nil {{ issues.append(JstIssue(path: \"\", message: \"pattern\")) }}"));
                     }
                     checks.push("        }".to_string());
                 }
@@ -1342,48 +1422,44 @@ fn emit_type_guarded_wrapper(name: &str, guards: &[(TypeGuard, Box<SchemaIr>)], 
                 checks.push("        if let n = raw.value as? Double, !(raw.value is Bool) {".to_string());
                 if let Some(v) = c.minimum {
                     let b = format_number(v);
-                    checks.push(format!("            if n < {b} {{ throw ValidationError.outOfRange(\"value\", \"minimum\") }}"));
+                    checks.push(format!("            if n < {b} {{ issues.append(JstIssue(path: \"\", message: \"minimum\")) }}"));
                 }
                 if let Some(v) = c.maximum {
                     let b = format_number(v);
-                    checks.push(format!("            if n > {b} {{ throw ValidationError.outOfRange(\"value\", \"maximum\") }}"));
+                    checks.push(format!("            if n > {b} {{ issues.append(JstIssue(path: \"\", message: \"maximum\")) }}"));
                 }
                 if let Some(v) = c.exclusive_minimum {
                     let b = format_number(v);
-                    checks.push(format!("            if n <= {b} {{ throw ValidationError.outOfRange(\"value\", \"exclusiveMinimum\") }}"));
+                    checks.push(format!("            if n <= {b} {{ issues.append(JstIssue(path: \"\", message: \"exclusiveMinimum\")) }}"));
                 }
                 if let Some(v) = c.exclusive_maximum {
                     let b = format_number(v);
-                    checks.push(format!("            if n >= {b} {{ throw ValidationError.outOfRange(\"value\", \"exclusiveMaximum\") }}"));
+                    checks.push(format!("            if n >= {b} {{ issues.append(JstIssue(path: \"\", message: \"exclusiveMaximum\")) }}"));
                 }
                 if let Some(v) = c.multiple_of {
                     let b = format_number(v);
-                    checks.push(format!("            if (n / {b}).isInfinite {{ throw ValidationError.outOfRange(\"value\", \"multipleOf\") }}"));
-                    checks.push(format!("            let _mof = n.remainder(dividingBy: {b})"));
-                    checks.push(format!("            if _mof.isNaN || _mof.isInfinite || (abs(_mof) > 1e-9 && abs(abs(_mof) - {b}) > 1e-9) {{ throw ValidationError.outOfRange(\"value\", \"multipleOf\") }}"));
+                    checks.push(format!("            if (n / {b}).isInfinite {{ issues.append(JstIssue(path: \"\", message: \"multipleOf\")) }} else {{ let _mof = n.remainder(dividingBy: {b}); if _mof.isNaN || _mof.isInfinite || (abs(_mof) > 1e-9 && abs(abs(_mof) - {b}) > 1e-9) {{ issues.append(JstIssue(path: \"\", message: \"multipleOf\")) }} }}"));
                 }
                 checks.push("        } else if let n = raw.value as? Int, !(raw.value is Bool) {".to_string());
                 if let Some(v) = c.minimum {
                     let b = format_number(v);
-                    checks.push(format!("            if Double(n) < {b} {{ throw ValidationError.outOfRange(\"value\", \"minimum\") }}"));
+                    checks.push(format!("            if Double(n) < {b} {{ issues.append(JstIssue(path: \"\", message: \"minimum\")) }}"));
                 }
                 if let Some(v) = c.maximum {
                     let b = format_number(v);
-                    checks.push(format!("            if Double(n) > {b} {{ throw ValidationError.outOfRange(\"value\", \"maximum\") }}"));
+                    checks.push(format!("            if Double(n) > {b} {{ issues.append(JstIssue(path: \"\", message: \"maximum\")) }}"));
                 }
                 if let Some(v) = c.exclusive_minimum {
                     let b = format_number(v);
-                    checks.push(format!("            if Double(n) <= {b} {{ throw ValidationError.outOfRange(\"value\", \"exclusiveMinimum\") }}"));
+                    checks.push(format!("            if Double(n) <= {b} {{ issues.append(JstIssue(path: \"\", message: \"exclusiveMinimum\")) }}"));
                 }
                 if let Some(v) = c.exclusive_maximum {
                     let b = format_number(v);
-                    checks.push(format!("            if Double(n) >= {b} {{ throw ValidationError.outOfRange(\"value\", \"exclusiveMaximum\") }}"));
+                    checks.push(format!("            if Double(n) >= {b} {{ issues.append(JstIssue(path: \"\", message: \"exclusiveMaximum\")) }}"));
                 }
                 if let Some(v) = c.multiple_of {
                     let b = format_number(v);
-                    checks.push(format!("            if (Double(n) / {b}).isInfinite {{ throw ValidationError.outOfRange(\"value\", \"multipleOf\") }}"));
-                    checks.push(format!("            let _mofi = Double(n).remainder(dividingBy: {b})"));
-                    checks.push(format!("            if _mofi.isNaN || _mofi.isInfinite || (abs(_mofi) > 1e-9 && abs(abs(_mofi) - {b}) > 1e-9) {{ throw ValidationError.outOfRange(\"value\", \"multipleOf\") }}"));
+                    checks.push(format!("            if (Double(n) / {b}).isInfinite {{ issues.append(JstIssue(path: \"\", message: \"multipleOf\")) }} else {{ let _mofi = Double(n).remainder(dividingBy: {b}); if _mofi.isNaN || _mofi.isInfinite || (abs(_mofi) > 1e-9 && abs(abs(_mofi) - {b}) > 1e-9) {{ issues.append(JstIssue(path: \"\", message: \"multipleOf\")) }} }}"));
                 }
                 checks.push("        }".to_string());
             }
@@ -1393,8 +1469,8 @@ fn emit_type_guarded_wrapper(name: &str, guards: &[(TypeGuard, Box<SchemaIr>)], 
                     for (k, f) in &obj.fields {
                         if f.required {
                             checks.push(format!(
-                                "            if dict[\"{}\"] == nil {{ throw ValidationError.outOfRange(\"value\", \"missing required: {}\") }}",
-                                swift_escape(k), swift_escape(k)
+                                "            if dict[\"{}\"] == nil {{ issues.append(JstIssue(path: \"/{}\", message: \"required property is missing\")) }}",
+                                swift_escape(k), ptr_escape(k)
                             ));
                         }
                     }
@@ -1405,15 +1481,15 @@ fn emit_type_guarded_wrapper(name: &str, guards: &[(TypeGuard, Box<SchemaIr>)], 
                         let (fp, ft) = emit_swift_sub_schema("FV", &f.schema, defs, &mut fc);
                         if !fp.is_empty() { preamble.push_str(&fp); }
                         checks.push(format!(
-                            "            if dict[\"{k}\"] != nil {{ let fd = _serializeAny(dict[\"{k}\"]!); let _ = try JSONDecoder().decode({ft}.self, from: fd) }}",
-                            k = swift_escape(k)
+                            "            if dict[\"{k}\"] != nil {{ let fd = _serializeAny(dict[\"{k}\"]!); do {{ let _ = try JSONDecoder().decode({ft}.self, from: fd) }} catch {{ issues.append(contentsOf: _jstIssues(error, at: \"/{kp}\")) }} }}",
+                            k = swift_escape(k), kp = ptr_escape(k)
                         ));
                     }
                     if let Some(min) = obj.min_properties {
-                        checks.push(format!("            if dict.count < {min} {{ throw ValidationError.outOfRange(\"value\", \"minProperties\") }}"));
+                        checks.push(format!("            if dict.count < {min} {{ issues.append(JstIssue(path: \"\", message: \"minProperties\")) }}"));
                     }
                     if let Some(max) = obj.max_properties {
-                        checks.push(format!("            if dict.count > {max} {{ throw ValidationError.outOfRange(\"value\", \"maxProperties\") }}"));
+                        checks.push(format!("            if dict.count > {max} {{ issues.append(JstIssue(path: \"\", message: \"maxProperties\")) }}"));
                     }
                     // patternProperties + additionalProperties
                     if !obj.pattern_properties.is_empty() {
@@ -1425,25 +1501,25 @@ fn emit_type_guarded_wrapper(name: &str, guards: &[(TypeGuard, Box<SchemaIr>)], 
                             let (pp_pre, pt) = emit_swift_sub_schema("PP", pp_schema, defs, &mut pp_c);
                             if !pp_pre.is_empty() { preamble.push_str(&pp_pre); }
                             checks.push(format!(
-                                "                if k.range(of: \"{}\", options: .regularExpression) != nil {{ matched = true; let pd = _serializeAny(v); let _ = try JSONDecoder().decode({pt}.self, from: pd) }}",
+                                "                if k.range(of: \"{}\", options: .regularExpression) != nil {{ matched = true; let pd = _serializeAny(v); do {{ let _ = try JSONDecoder().decode({pt}.self, from: pd) }} catch {{ issues.append(contentsOf: _jstIssues(error, at: \"/\" + _jstPtr(k))) }} }}",
                                 swift_escape(pattern)
                             ));
                         }
                         if matches!(obj.additional_properties, AdditionalProperties::Forbidden) {
                             let ks = if known.is_empty() { "Set<String>()".to_string() } else { format!("Set([{}])", known.join(", ")) };
-                            checks.push(format!("                if !matched && !{ks}.contains(k) {{ throw ValidationError.outOfRange(k, \"unexpected property\") }}"));
+                            checks.push(format!("                if !matched && !{ks}.contains(k) {{ issues.append(JstIssue(path: \"/\" + _jstPtr(k), message: \"unexpected property\")) }}"));
                         } else if let AdditionalProperties::Schema(ap) = &obj.additional_properties {
                             let mut ap_c = 0usize;
                             let (ap_pre, at) = emit_swift_sub_schema("AP", ap, defs, &mut ap_c);
                             if !ap_pre.is_empty() { preamble.push_str(&ap_pre); }
                             let ks = if known.is_empty() { "Set<String>()".to_string() } else { format!("Set([{}])", known.join(", ")) };
-                            checks.push(format!("                if !matched && !{ks}.contains(k) {{ let ad = _serializeAny(v); let _ = try JSONDecoder().decode({at}.self, from: ad) }}"));
+                            checks.push(format!("                if !matched && !{ks}.contains(k) {{ let ad = _serializeAny(v); do {{ let _ = try JSONDecoder().decode({at}.self, from: ad) }} catch {{ issues.append(contentsOf: _jstIssues(error, at: \"/\" + _jstPtr(k))) }} }}"));
                         }
                         checks.push("            }".to_string());
                     } else if matches!(obj.additional_properties, AdditionalProperties::Forbidden) {
                         let known: Vec<String> = obj.fields.keys().map(|k| format!("\"{}\"", swift_escape(k))).collect();
                         let ks = if known.is_empty() { "Set<String>()".to_string() } else { format!("Set([{}])", known.join(", ")) };
-                        checks.push(format!("            for k in dict.keys where !{ks}.contains(k) {{ throw ValidationError.outOfRange(k, \"unexpected property\") }}"));
+                        checks.push(format!("            for k in dict.keys where !{ks}.contains(k) {{ issues.append(JstIssue(path: \"/\" + _jstPtr(k), message: \"unexpected property\")) }}"));
                     } else if let AdditionalProperties::Schema(ap) = &obj.additional_properties {
                         let mut ap_c = 0usize;
                         let (ap_pre, at) = emit_swift_sub_schema("AP", ap, defs, &mut ap_c);
@@ -1451,7 +1527,7 @@ fn emit_type_guarded_wrapper(name: &str, guards: &[(TypeGuard, Box<SchemaIr>)], 
                         let known: Vec<String> = obj.fields.keys().map(|k| format!("\"{}\"", swift_escape(k))).collect();
                         let ks = if known.is_empty() { "Set<String>()".to_string() } else { format!("Set([{}])", known.join(", ")) };
                         if at != "AnyCodable" {
-                            checks.push(format!("            for (k, v) in dict where !{ks}.contains(k) {{ let ad = _serializeAny(v); let _ = try JSONDecoder().decode({at}.self, from: ad) }}"));
+                            checks.push(format!("            for (k, v) in dict where !{ks}.contains(k) {{ let ad = _serializeAny(v); do {{ let _ = try JSONDecoder().decode({at}.self, from: ad) }} catch {{ issues.append(contentsOf: _jstIssues(error, at: \"/\" + _jstPtr(k))) }} }}"));
                         }
                     }
                     // propertyNames
@@ -1462,8 +1538,8 @@ fn emit_type_guarded_wrapper(name: &str, guards: &[(TypeGuard, Box<SchemaIr>)], 
                     for (prop, required) in &obj.dependent_required {
                         for r in required {
                             checks.push(format!(
-                                "            if dict[\"{}\"] != nil && dict[\"{}\"] == nil {{ throw ValidationError.outOfRange(\"{}\", \"dependentRequired\") }}",
-                                swift_escape(prop), swift_escape(r), swift_escape(r)
+                                "            if dict[\"{}\"] != nil && dict[\"{}\"] == nil {{ issues.append(JstIssue(path: \"/{}\", message: \"dependentRequired\")) }}",
+                                swift_escape(prop), swift_escape(r), ptr_escape(r)
                             ));
                         }
                     }
@@ -1475,7 +1551,7 @@ fn emit_type_guarded_wrapper(name: &str, guards: &[(TypeGuard, Box<SchemaIr>)], 
                             preamble.push_str(&sub_pre);
                         }
                         checks.push(format!(
-                            "            if dict[\"{}\"] != nil {{ let dd = _serializeAny(raw.value); let _ = try JSONDecoder().decode({dt}.self, from: dd) }}",
+                            "            if dict[\"{}\"] != nil {{ let dd = _serializeAny(raw.value); do {{ let _ = try JSONDecoder().decode({dt}.self, from: dd) }} catch {{ issues.append(contentsOf: _jstIssues(error, at: \"\")) }} }}",
                             swift_escape(prop)
                         ));
                     }
@@ -1486,7 +1562,7 @@ fn emit_type_guarded_wrapper(name: &str, guards: &[(TypeGuard, Box<SchemaIr>)], 
                     let vt = swift_type(&rec.value, defs);
                     if vt != "AnyCodable" {
                         checks.push("        if let dict = raw.value as? [String: Any] {".to_string());
-                        checks.push(format!("            for (_, v) in dict {{ let rd = _serializeAny(v); let _ = try JSONDecoder().decode({vt}.self, from: rd) }}"));
+                        checks.push(format!("            for (k, v) in dict {{ let rd = _serializeAny(v); do {{ let _ = try JSONDecoder().decode({vt}.self, from: rd) }} catch {{ issues.append(contentsOf: _jstIssues(error, at: \"/\" + _jstPtr(k))) }} }}"));
                         checks.push("        }".to_string());
                     }
                 }
@@ -1495,20 +1571,21 @@ fn emit_type_guarded_wrapper(name: &str, guards: &[(TypeGuard, Box<SchemaIr>)], 
                 if let SchemaIr::Array(arr) = schema.as_ref() {
                     checks.push("        if let arr = raw.value as? [Any] {".to_string());
                     if let Some(min) = arr.min_items {
-                        checks.push(format!("            if arr.count < {min} {{ throw ValidationError.outOfRange(\"value\", \"minItems\") }}"));
+                        checks.push(format!("            if arr.count < {min} {{ issues.append(JstIssue(path: \"\", message: \"minItems\")) }}"));
                     }
                     if let Some(max) = arr.max_items {
-                        checks.push(format!("            if arr.count > {max} {{ throw ValidationError.outOfRange(\"value\", \"maxItems\") }}"));
+                        checks.push(format!("            if arr.count > {max} {{ issues.append(JstIssue(path: \"\", message: \"maxItems\")) }}"));
                     }
                     if !matches!(arr.items.as_ref(), SchemaIr::Any) {
                         let mut item_counter = 0usize;
                         let (item_pre, it) = emit_swift_sub_schema("ArrItem", &arr.items, defs, &mut item_counter);
                         if !item_pre.is_empty() { preamble.push_str(&item_pre); }
-                        checks.push(format!("            for item in arr {{ let id = _serializeAny(item); let _ = try JSONDecoder().decode({it}.self, from: id) }}"));
+                        checks.push(format!("            for (i, item) in arr.enumerated() {{ let id = _serializeAny(item); do {{ let _ = try JSONDecoder().decode({it}.self, from: id) }} catch {{ issues.append(contentsOf: _jstIssues(error, at: \"/\\(i)\")) }} }}"));
                     }
                     if arr.unique_items {
                         checks.push("            let ser = try arr.map { try String(data: _serializeAny($0), encoding: .utf8) ?? \"\" }".to_string());
-                        checks.push("            if Set(ser).count != arr.count { throw ValidationError.outOfRange(\"value\", \"uniqueItems\") }".to_string());
+                        checks.push("            var seen = Set<String>()".to_string());
+                        checks.push("            for (i, s) in ser.enumerated() { if !seen.insert(s).inserted { issues.append(JstIssue(path: \"/\\(i)\", message: \"uniqueItems\")) } }".to_string());
                     }
                     if let Some(contains) = &arr.contains {
                         let mut ct_counter = 0usize;
@@ -1516,9 +1593,9 @@ fn emit_type_guarded_wrapper(name: &str, guards: &[(TypeGuard, Box<SchemaIr>)], 
                         if !ct_pre.is_empty() { preamble.push_str(&ct_pre); }
                         let min = contains.min_contains.unwrap_or(1);
                         checks.push(format!("            let mc = arr.filter {{ i in (try? JSONDecoder().decode({ct}.self, from: _serializeAny(i))) != nil }}.count"));
-                        checks.push(format!("            if mc < {min} {{ throw ValidationError.outOfRange(\"value\", \"must contain at least {min} matching items\") }}"));
+                        checks.push(format!("            if mc < {min} {{ issues.append(JstIssue(path: \"\", message: \"must contain at least {min} matching items\")) }}"));
                         if let Some(max) = contains.max_contains {
-                            checks.push(format!("            if mc > {max} {{ throw ValidationError.outOfRange(\"value\", \"must contain at most {max} matching items\") }}"));
+                            checks.push(format!("            if mc > {max} {{ issues.append(JstIssue(path: \"\", message: \"must contain at most {max} matching items\")) }}"));
                         }
                     }
                     checks.push("        }".to_string());
@@ -1531,7 +1608,7 @@ fn emit_type_guarded_wrapper(name: &str, guards: &[(TypeGuard, Box<SchemaIr>)], 
                         let mut ti_c = 0usize;
                         let (ti_pre, it) = emit_swift_sub_schema("TI", item, defs, &mut ti_c);
                         if !ti_pre.is_empty() { preamble.push_str(&ti_pre); }
-                        checks.push(format!("            if arr.count > {i} {{ let td = _serializeAny(arr[{i}]); let _ = try JSONDecoder().decode({it}.self, from: td) }}"));
+                        checks.push(format!("            if arr.count > {i} {{ let td = _serializeAny(arr[{i}]); do {{ let _ = try JSONDecoder().decode({it}.self, from: td) }} catch {{ issues.append(contentsOf: _jstIssues(error, at: \"/{i}\")) }} }}"));
                     }
                     let pc = tuple.items.len();
                     if let Some(rest) = &tuple.rest {
@@ -1539,20 +1616,21 @@ fn emit_type_guarded_wrapper(name: &str, guards: &[(TypeGuard, Box<SchemaIr>)], 
                             let mut rest_c = 0usize;
                             let (rest_pre, rt) = emit_swift_sub_schema("Rest", rest, defs, &mut rest_c);
                             if !rest_pre.is_empty() { preamble.push_str(&rest_pre); }
-                            checks.push(format!("            for ri in {pc}..<arr.count {{ let rd = _serializeAny(arr[ri]); let _ = try JSONDecoder().decode({rt}.self, from: rd) }}"));
+                            checks.push(format!("            for ri in {pc}..<arr.count {{ let rd = _serializeAny(arr[ri]); do {{ let _ = try JSONDecoder().decode({rt}.self, from: rd) }} catch {{ issues.append(contentsOf: _jstIssues(error, at: \"/\\(ri)\")) }} }}"));
                         }
                     } else {
-                        checks.push(format!("            if arr.count > {pc} {{ throw ValidationError.outOfRange(\"value\", \"too many items\") }}"));
+                        checks.push(format!("            if arr.count > {pc} {{ issues.append(JstIssue(path: \"\", message: \"too many items\")) }}"));
                     }
                     if let Some(min) = tuple.min_items {
-                        checks.push(format!("            if arr.count < {min} {{ throw ValidationError.outOfRange(\"value\", \"minItems\") }}"));
+                        checks.push(format!("            if arr.count < {min} {{ issues.append(JstIssue(path: \"\", message: \"minItems\")) }}"));
                     }
                     if let Some(max) = tuple.max_items {
-                        checks.push(format!("            if arr.count > {max} {{ throw ValidationError.outOfRange(\"value\", \"maxItems\") }}"));
+                        checks.push(format!("            if arr.count > {max} {{ issues.append(JstIssue(path: \"\", message: \"maxItems\")) }}"));
                     }
                     if tuple.unique_items {
                         checks.push("            let ser = try arr.map { try String(data: _serializeAny($0), encoding: .utf8) ?? \"\" }".to_string());
-                        checks.push("            if Set(ser).count != arr.count { throw ValidationError.outOfRange(\"value\", \"uniqueItems\") }".to_string());
+                        checks.push("            var seen = Set<String>()".to_string());
+                        checks.push("            for (i, s) in ser.enumerated() { if !seen.insert(s).inserted { issues.append(JstIssue(path: \"/\\(i)\", message: \"uniqueItems\")) } }".to_string());
                     }
                     checks.push("        }".to_string());
                 }
@@ -1560,9 +1638,9 @@ fn emit_type_guarded_wrapper(name: &str, guards: &[(TypeGuard, Box<SchemaIr>)], 
         }
     }
 
+    let guards = collect_block(checks);
     let body = format!(
-        "struct {name}: Codable, Validatable {{\n    let value: AnyCodable\n\n    // @validate\n    init(from decoder: Decoder) throws {{\n        let container = try decoder.singleValueContainer()\n        let raw = try container.decode(AnyCodable.self)\n        value = raw\n{}\n    }}\n\n    func encode(to encoder: Encoder) throws {{\n        var container = encoder.singleValueContainer()\n        try container.encode(value)\n    }}\n}}",
-        checks.join("\n")
+        "struct {name}: Codable, Validatable {{\n    let value: AnyCodable\n\n    // @validate\n    init(from decoder: Decoder) throws {{\n        let container = try decoder.singleValueContainer()\n        let raw = try container.decode(AnyCodable.self)\n        value = raw\n{guards}\n    }}\n\n    func encode(to encoder: Encoder) throws {{\n        var container = encoder.singleValueContainer()\n        try container.encode(value)\n    }}\n}}"
     );
     format!("{preamble}{body}")
 }
@@ -1571,24 +1649,24 @@ fn emit_literal_wrapper(name: &str, lit: &LiteralValue) -> String {
     let check = match lit {
         LiteralValue::Bool(b) => {
             let val = if *b { "true" } else { "false" };
-            format!("        guard (raw.value as? Bool) == {val} else {{ throw ValidationError.outOfRange(\"value\", \"must be {val}\") }}")
+            format!("        guard (raw.value as? Bool) == {val} else {{ throw JstValidationError(issues: [JstIssue(path: \"\", message: \"must be {val}\")]) }}")
         }
         LiteralValue::Integer(i) => {
             // JSON numbers 2 and 2.0 are equal — accept either representation.
-            format!("        guard !(raw.value is Bool), ((raw.value as? Int) == {i} || (raw.value as? Double) == Double({i})) else {{ throw ValidationError.outOfRange(\"value\", \"must be {i}\") }}")
+            format!("        guard !(raw.value is Bool), ((raw.value as? Int) == {i} || (raw.value as? Double) == Double({i})) else {{ throw JstValidationError(issues: [JstIssue(path: \"\", message: \"must be {i}\")]) }}")
         }
         LiteralValue::Number(n) => {
             let b = format_number(*n);
-            format!("        guard !(raw.value is Bool), ((raw.value as? Double) == {b} || (raw.value as? Int).map(Double.init) == {b}) else {{ throw ValidationError.outOfRange(\"value\", \"must be {b}\") }}")
+            format!("        guard !(raw.value is Bool), ((raw.value as? Double) == {b} || (raw.value as? Int).map(Double.init) == {b}) else {{ throw JstValidationError(issues: [JstIssue(path: \"\", message: \"must be {b}\")]) }}")
         }
         LiteralValue::String(s) => {
             // Compare Unicode scalars: Swift's String == uses canonical
             // equivalence, which would wrongly equate combining-mark variants.
             let escaped = swift_escape(s);
-            format!("        guard let s = raw.value as? String, s.unicodeScalars.elementsEqual(\"{escaped}\".unicodeScalars) else {{ throw ValidationError.outOfRange(\"value\", \"must be \\\"{escaped}\\\"\") }}")
+            format!("        guard let s = raw.value as? String, s.unicodeScalars.elementsEqual(\"{escaped}\".unicodeScalars) else {{ throw JstValidationError(issues: [JstIssue(path: \"\", message: \"must be \\\"{escaped}\\\"\")]) }}")
         }
         LiteralValue::Null => {
-            "        guard raw.value is NSNull else { throw ValidationError.outOfRange(\"value\", \"must be null\") }".to_string()
+            "        guard raw.value is NSNull else { throw JstValidationError(issues: [JstIssue(path: \"\", message: \"must be null\")]) }".to_string()
         }
     };
 
@@ -1622,7 +1700,7 @@ fn emit_mixed_enum_wrapper(name: &str, lits: &[LiteralValue]) -> String {
 
     let condition = checks.join(" || ");
     format!(
-        "struct {name}: Codable, Validatable {{\n    let value: AnyCodable\n\n    // @validate\n    init(from decoder: Decoder) throws {{\n        let container = try decoder.singleValueContainer()\n        let raw = try container.decode(AnyCodable.self)\n        value = raw\n        guard {condition} else {{ throw ValidationError.outOfRange(\"value\", \"must be one of the allowed values\") }}\n    }}\n\n    func encode(to encoder: Encoder) throws {{\n        var container = encoder.singleValueContainer()\n        try container.encode(value)\n    }}\n}}"
+        "struct {name}: Codable, Validatable {{\n    let value: AnyCodable\n\n    // @validate\n    init(from decoder: Decoder) throws {{\n        let container = try decoder.singleValueContainer()\n        let raw = try container.decode(AnyCodable.self)\n        value = raw\n        guard {condition} else {{ throw JstValidationError(issues: [JstIssue(path: \"\", message: \"must be one of the allowed values\")]) }}\n    }}\n\n    func encode(to encoder: Encoder) throws {{\n        var container = encoder.singleValueContainer()\n        try container.encode(value)\n    }}\n}}"
     )
 }
 
@@ -1631,7 +1709,7 @@ fn emit_const_equal_wrapper(name: &str, val: &serde_json::Value) -> String {
     let escaped = swift_escape(&json_str);
 
     format!(
-        "struct {name}: Codable, Validatable {{\n    let value: AnyCodable\n\n    // @validate\n    init(from decoder: Decoder) throws {{\n        let container = try decoder.singleValueContainer()\n        let raw = try container.decode(AnyCodable.self)\n        value = raw\n        let expectedData = \"{escaped}\".data(using: .utf8)!\n        let expected = try JSONDecoder().decode(AnyCodable.self, from: expectedData)\n        let rawData = _serializeAny(raw.value)\n        let expData = _serializeAny(expected.value)\n        guard rawData == expData else {{ throw ValidationError.outOfRange(\"value\", \"must equal const value\") }}\n    }}\n\n    func encode(to encoder: Encoder) throws {{\n        var container = encoder.singleValueContainer()\n        try container.encode(value)\n    }}\n}}"
+        "struct {name}: Codable, Validatable {{\n    let value: AnyCodable\n\n    // @validate\n    init(from decoder: Decoder) throws {{\n        let container = try decoder.singleValueContainer()\n        let raw = try container.decode(AnyCodable.self)\n        value = raw\n        let expectedData = \"{escaped}\".data(using: .utf8)!\n        let expected = try JSONDecoder().decode(AnyCodable.self, from: expectedData)\n        let rawData = _serializeAny(raw.value)\n        let expData = _serializeAny(expected.value)\n        guard rawData == expData else {{ throw JstValidationError(issues: [JstIssue(path: \"\", message: \"must equal const value\")]) }}\n    }}\n\n    func encode(to encoder: Encoder) throws {{\n        var container = encoder.singleValueContainer()\n        try container.encode(value)\n    }}\n}}"
     )
 }
 
@@ -1640,7 +1718,7 @@ fn emit_complex_enum_wrapper(name: &str, vals: &[serde_json::Value]) -> String {
     let escaped = swift_escape(&json_str);
 
     format!(
-        "struct {name}: Codable, Validatable {{\n    let value: AnyCodable\n\n    // @validate\n    init(from decoder: Decoder) throws {{\n        let container = try decoder.singleValueContainer()\n        let raw = try container.decode(AnyCodable.self)\n        value = raw\n        let allowedData = \"{escaped}\".data(using: .utf8)!\n        let allowed = try JSONDecoder().decode([AnyCodable].self, from: allowedData)\n        let rawData = _serializeAny(raw.value)\n        let matched = allowed.contains {{ a in (try? _serializeAny(a.value)) == rawData }}\n        guard matched else {{ throw ValidationError.outOfRange(\"value\", \"must be one of the allowed values\") }}\n    }}\n\n    func encode(to encoder: Encoder) throws {{\n        var container = encoder.singleValueContainer()\n        try container.encode(value)\n    }}\n}}"
+        "struct {name}: Codable, Validatable {{\n    let value: AnyCodable\n\n    // @validate\n    init(from decoder: Decoder) throws {{\n        let container = try decoder.singleValueContainer()\n        let raw = try container.decode(AnyCodable.self)\n        value = raw\n        let allowedData = \"{escaped}\".data(using: .utf8)!\n        let allowed = try JSONDecoder().decode([AnyCodable].self, from: allowedData)\n        let rawData = _serializeAny(raw.value)\n        let matched = allowed.contains {{ a in (try? _serializeAny(a.value)) == rawData }}\n        guard matched else {{ throw JstValidationError(issues: [JstIssue(path: \"\", message: \"must be one of the allowed values\")]) }}\n    }}\n\n    func encode(to encoder: Encoder) throws {{\n        var container = encoder.singleValueContainer()\n        try container.encode(value)\n    }}\n}}"
     )
 }
 
@@ -1660,7 +1738,7 @@ fn emit_swift_sub_schema(prefix: &str, ir: &SchemaIr, defs: &[DefEntry], _counte
         let idx = SUB_SCHEMA_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
         let sub_name = format!("_{prefix}{idx}");
         let def = format!(
-            "private struct {sub_name}: Codable, Validatable {{\n    // @validate\n    init(from decoder: Decoder) throws {{\n        throw ValidationError.outOfRange(\"value\", \"schema rejects all values\")\n    }}\n    func encode(to encoder: Encoder) throws {{}}\n}}"
+            "private struct {sub_name}: Codable, Validatable {{\n    // @validate\n    init(from decoder: Decoder) throws {{\n        throw JstValidationError(issues: [JstIssue(path: \"\", message: \"schema rejects all values\")])\n    }}\n    func encode(to encoder: Encoder) throws {{}}\n}}"
         );
         return (format!("{def}\n\n"), sub_name);
     }
@@ -1719,7 +1797,7 @@ fn emit_not_wrapper(name: &str, _base: &SchemaIr, not_schema: &SchemaIr, defs: &
     let mut counter = 0usize;
     let (preamble, not_type) = emit_swift_sub_schema("Not", not_schema, defs, &mut counter);
     let body = format!(
-        "struct {name}: Codable, Validatable {{\n    let value: AnyCodable\n\n    // @validate\n    init(from decoder: Decoder) throws {{\n        let container = try decoder.singleValueContainer()\n        let raw = try container.decode(AnyCodable.self)\n        value = raw\n        let data = _serializeAny(raw.value)\n        if (try? JSONDecoder().decode({not_type}.self, from: data)) != nil {{\n            throw ValidationError.outOfRange(\"value\", \"must not match excluded schema\")\n        }}\n    }}\n\n    func encode(to encoder: Encoder) throws {{\n        var container = encoder.singleValueContainer()\n        try container.encode(value)\n    }}\n}}"
+        "struct {name}: Codable, Validatable {{\n    let value: AnyCodable\n\n    // @validate\n    init(from decoder: Decoder) throws {{\n        let container = try decoder.singleValueContainer()\n        let raw = try container.decode(AnyCodable.self)\n        value = raw\n        let data = _serializeAny(raw.value)\n        if (try? JSONDecoder().decode({not_type}.self, from: data)) != nil {{\n            throw JstValidationError(issues: [JstIssue(path: \"\", message: \"must not match excluded schema\")])\n        }}\n    }}\n\n    func encode(to encoder: Encoder) throws {{\n        var container = encoder.singleValueContainer()\n        try container.encode(value)\n    }}\n}}"
     );
     format!("{preamble}{body}")
 }
@@ -1737,7 +1815,7 @@ fn emit_oneof_wrapper(name: &str, members: &[SchemaIr], defs: &[DefEntry]) -> St
     }
 
     let body = format!(
-        "struct {name}: Codable, Validatable {{\n    let value: AnyCodable\n\n    // @validate\n    init(from decoder: Decoder) throws {{\n        let container = try decoder.singleValueContainer()\n        let raw = try container.decode(AnyCodable.self)\n        value = raw\n        let data = _serializeAny(raw.value)\n        var matches = 0\n{}\n        guard matches == 1 else {{ throw ValidationError.outOfRange(\"value\", \"must match exactly one schema\") }}\n    }}\n\n    func encode(to encoder: Encoder) throws {{\n        var container = encoder.singleValueContainer()\n        try container.encode(value)\n    }}\n}}",
+        "struct {name}: Codable, Validatable {{\n    let value: AnyCodable\n\n    // @validate\n    init(from decoder: Decoder) throws {{\n        let container = try decoder.singleValueContainer()\n        let raw = try container.decode(AnyCodable.self)\n        value = raw\n        let data = _serializeAny(raw.value)\n        var matches = 0\n{}\n        guard matches == 1 else {{ throw JstValidationError(issues: [JstIssue(path: \"\", message: \"must match exactly one schema\")]) }}\n    }}\n\n    func encode(to encoder: Encoder) throws {{\n        var container = encoder.singleValueContainer()\n        try container.encode(value)\n    }}\n}}",
         type_checks.join("\n")
     );
     format!("{preamble}{body}")
@@ -1746,18 +1824,21 @@ fn emit_oneof_wrapper(name: &str, members: &[SchemaIr], defs: &[DefEntry]) -> St
 fn emit_intersection_wrapper(name: &str, members: &[SchemaIr], defs: &[DefEntry]) -> String {
     let mut counter = 0usize;
     let mut preamble = String::new();
+    // allOf accumulates per-member: the members were already checked
+    // sequentially, so each failure becomes issue(s) (all schemas validate
+    // the same root value, hence the "" prefix) and every member is reported.
     let mut validation_lines = Vec::new();
     for member in members {
         let (p, member_type) = emit_swift_sub_schema("Inter", member, defs, &mut counter);
         preamble.push_str(&p);
         validation_lines.push(format!(
-            "        let _ = try JSONDecoder().decode({member_type}.self, from: data)"
+            "        do {{ let _ = try JSONDecoder().decode({member_type}.self, from: data) }} catch {{ issues.append(contentsOf: _jstIssues(error, at: \"\")) }}"
         ));
     }
 
+    let guards = collect_block(validation_lines);
     let body = format!(
-        "struct {name}: Codable, Validatable {{\n    let value: AnyCodable\n\n    // @validate\n    init(from decoder: Decoder) throws {{\n        let container = try decoder.singleValueContainer()\n        let raw = try container.decode(AnyCodable.self)\n        value = raw\n        let data = _serializeAny(raw.value)\n{}\n    }}\n\n    func encode(to encoder: Encoder) throws {{\n        var container = encoder.singleValueContainer()\n        try container.encode(value)\n    }}\n}}",
-        validation_lines.join("\n")
+        "struct {name}: Codable, Validatable {{\n    let value: AnyCodable\n\n    // @validate\n    init(from decoder: Decoder) throws {{\n        let container = try decoder.singleValueContainer()\n        let raw = try container.decode(AnyCodable.self)\n        value = raw\n        let data = _serializeAny(raw.value)\n{guards}\n    }}\n\n    func encode(to encoder: Encoder) throws {{\n        var container = encoder.singleValueContainer()\n        try container.encode(value)\n    }}\n}}"
     );
     format!("{preamble}{body}")
 }
@@ -1778,18 +1859,19 @@ fn emit_conditional_wrapper(
     body.push(format!(
         "        let ifMatched = (try? JSONDecoder().decode({if_type}.self, from: data)) != nil"
     ));
+    // Verdict-only issues, matching the other compositions.
     if let Some(then_s) = then_schema {
         let (p, then_type) = emit_swift_sub_schema("Then", then_s, defs, &mut counter);
         preamble.push_str(&p);
         body.push(format!(
-            "        if ifMatched {{ let _ = try JSONDecoder().decode({then_type}.self, from: data) }}"
+            "        if ifMatched, (try? JSONDecoder().decode({then_type}.self, from: data)) == nil {{ throw JstValidationError(issues: [JstIssue(path: \"\", message: \"does not match the then schema\")]) }}"
         ));
     }
     if let Some(else_s) = else_schema {
         let (p, else_type) = emit_swift_sub_schema("Else", else_s, defs, &mut counter);
         preamble.push_str(&p);
         body.push(format!(
-            "        if !ifMatched {{ let _ = try JSONDecoder().decode({else_type}.self, from: data) }}"
+            "        if !ifMatched, (try? JSONDecoder().decode({else_type}.self, from: data)) == nil {{ throw JstValidationError(issues: [JstIssue(path: \"\", message: \"does not match the else schema\")]) }}"
         ));
     }
 
@@ -1813,7 +1895,7 @@ fn emit_anyof_wrapper(name: &str, members: &[SchemaIr], defs: &[DefEntry]) -> St
     }
 
     let body = format!(
-        "struct {name}: Codable, Validatable {{\n    let value: AnyCodable\n\n    // @validate\n    init(from decoder: Decoder) throws {{\n        let container = try decoder.singleValueContainer()\n        let raw = try container.decode(AnyCodable.self)\n        value = raw\n        let data = _serializeAny(raw.value)\n        var matches = 0\n{}\n        guard matches >= 1 else {{ throw ValidationError.outOfRange(\"value\", \"must match at least one schema\") }}\n    }}\n\n    func encode(to encoder: Encoder) throws {{\n        var container = encoder.singleValueContainer()\n        try container.encode(value)\n    }}\n}}",
+        "struct {name}: Codable, Validatable {{\n    let value: AnyCodable\n\n    // @validate\n    init(from decoder: Decoder) throws {{\n        let container = try decoder.singleValueContainer()\n        let raw = try container.decode(AnyCodable.self)\n        value = raw\n        let data = _serializeAny(raw.value)\n        var matches = 0\n{}\n        guard matches >= 1 else {{ throw JstValidationError(issues: [JstIssue(path: \"\", message: \"must match at least one schema\")]) }}\n    }}\n\n    func encode(to encoder: Encoder) throws {{\n        var container = encoder.singleValueContainer()\n        try container.encode(value)\n    }}\n}}",
         type_checks.join("\n")
     );
     format!("{preamble}{body}")
@@ -2047,39 +2129,40 @@ fn emit_property_names_check(
     let inner = unwrap_modifiers(pn);
     match inner {
         SchemaIr::Never => {
-            lines.push(format!("        if !{keys_expr}.isEmpty {{ throw ValidationError.outOfRange(\"value\", \"propertyNames: no properties allowed\") }}"));
+            lines.push(format!("        if !{keys_expr}.isEmpty {{ issues.append(JstIssue(path: \"\", message: \"propertyNames: no properties allowed\")) }}"));
         }
         SchemaIr::String(c) => {
             lines.push(format!("        for key in {keys_expr} {{"));
             if let Some(max) = c.max_length {
-                lines.push(format!("            if key.stringValue.count > {max} {{ throw ValidationError.outOfRange(key.stringValue, \"propertyNames\") }}"));
+                lines.push(format!("            if key.stringValue.count > {max} {{ issues.append(JstIssue(path: \"/\" + _jstPtr(key.stringValue), message: \"propertyNames\")) }}"));
             }
             if let Some(min) = c.min_length {
-                lines.push(format!("            if key.stringValue.count < {min} {{ throw ValidationError.outOfRange(key.stringValue, \"propertyNames\") }}"));
+                lines.push(format!("            if key.stringValue.count < {min} {{ issues.append(JstIssue(path: \"/\" + _jstPtr(key.stringValue), message: \"propertyNames\")) }}"));
             }
             if let Some(ref pat) = c.pattern {
-                lines.push(format!("            if key.stringValue.range(of: \"{}\", options: .regularExpression) == nil {{ throw ValidationError.outOfRange(key.stringValue, \"propertyNames\") }}", swift_escape(pat)));
+                lines.push(format!("            if key.stringValue.range(of: \"{}\", options: .regularExpression) == nil {{ issues.append(JstIssue(path: \"/\" + _jstPtr(key.stringValue), message: \"propertyNames\")) }}", swift_escape(pat)));
             }
             lines.push("        }".to_string());
         }
         SchemaIr::Literal(LiteralValue::String(s)) => {
             let escaped = swift_escape(s);
-            lines.push(format!("        for key in {keys_expr} {{ if key.stringValue != \"{escaped}\" {{ throw ValidationError.outOfRange(key.stringValue, \"propertyNames\") }} }}"));
+            lines.push(format!("        for key in {keys_expr} {{ if key.stringValue != \"{escaped}\" {{ issues.append(JstIssue(path: \"/\" + _jstPtr(key.stringValue), message: \"propertyNames\")) }} }}"));
         }
         SchemaIr::Enum(cases) => {
             let allowed: Vec<String> = cases.iter().map(|c| format!("\"{}\"", swift_escape(c))).collect();
             lines.push(format!("        let _pnAllowed: Set<String> = [{}]", allowed.join(", ")));
-            lines.push(format!("        for key in {keys_expr} {{ if !_pnAllowed.contains(key.stringValue) {{ throw ValidationError.outOfRange(key.stringValue, \"propertyNames\") }} }}"));
+            lines.push(format!("        for key in {keys_expr} {{ if !_pnAllowed.contains(key.stringValue) {{ issues.append(JstIssue(path: \"/\" + _jstPtr(key.stringValue), message: \"propertyNames\")) }} }}"));
         }
         _ => {
-            // Generic: serialize each key as JSON string and validate against sub-schema
+            // Generic: serialize each key as JSON string and validate against
+            // sub-schema (verdict-only per key)
             let mut sub_counter = 0usize;
             let (sub_pre, pn_type) = emit_swift_sub_schema("PN", pn, defs, &mut sub_counter);
             if !sub_pre.is_empty() {
                 preamble.push_str(&sub_pre);
             }
             if pn_type != "AnyCodable" {
-                lines.push(format!("        for key in {keys_expr} {{ let kd = _serializeAny(key.stringValue); let _ = try JSONDecoder().decode({pn_type}.self, from: kd) }}"));
+                lines.push(format!("        for key in {keys_expr} {{ let kd = _serializeAny(key.stringValue); if (try? JSONDecoder().decode({pn_type}.self, from: kd)) == nil {{ issues.append(JstIssue(path: \"/\" + _jstPtr(key.stringValue), message: \"propertyNames\")) }} }}"));
             }
         }
     }
@@ -2096,188 +2179,136 @@ fn emit_property_names_check_tg(
     let inner = unwrap_modifiers(pn);
     match inner {
         SchemaIr::Never => {
-            checks.push("            if !dict.isEmpty { throw ValidationError.outOfRange(\"value\", \"propertyNames: no properties allowed\") }".to_string());
+            checks.push("            if !dict.isEmpty { issues.append(JstIssue(path: \"\", message: \"propertyNames: no properties allowed\")) }".to_string());
         }
         SchemaIr::String(c) => {
             if let Some(max) = c.max_length {
-                checks.push(format!("            for k in dict.keys {{ if k.count > {max} {{ throw ValidationError.outOfRange(k, \"propertyNames\") }} }}"));
+                checks.push(format!("            for k in dict.keys {{ if k.count > {max} {{ issues.append(JstIssue(path: \"/\" + _jstPtr(k), message: \"propertyNames\")) }} }}"));
             }
             if let Some(min) = c.min_length {
-                checks.push(format!("            for k in dict.keys {{ if k.count < {min} {{ throw ValidationError.outOfRange(k, \"propertyNames\") }} }}"));
+                checks.push(format!("            for k in dict.keys {{ if k.count < {min} {{ issues.append(JstIssue(path: \"/\" + _jstPtr(k), message: \"propertyNames\")) }} }}"));
             }
             if let Some(ref pat) = c.pattern {
-                checks.push(format!("            for k in dict.keys {{ if k.range(of: \"{}\", options: .regularExpression) == nil {{ throw ValidationError.outOfRange(k, \"propertyNames\") }} }}", swift_escape(pat)));
+                checks.push(format!("            for k in dict.keys {{ if k.range(of: \"{}\", options: .regularExpression) == nil {{ issues.append(JstIssue(path: \"/\" + _jstPtr(k), message: \"propertyNames\")) }} }}", swift_escape(pat)));
             }
         }
         SchemaIr::Literal(LiteralValue::String(s)) => {
             let escaped = swift_escape(s);
-            checks.push(format!("            for k in dict.keys {{ if k != \"{escaped}\" {{ throw ValidationError.outOfRange(k, \"propertyNames\") }} }}"));
+            checks.push(format!("            for k in dict.keys {{ if k != \"{escaped}\" {{ issues.append(JstIssue(path: \"/\" + _jstPtr(k), message: \"propertyNames\")) }} }}"));
         }
         SchemaIr::Enum(cases) => {
             let allowed: Vec<String> = cases.iter().map(|c| format!("\"{}\"", swift_escape(c))).collect();
             checks.push(format!("            let _pnAllowed: Set<String> = [{}]", allowed.join(", ")));
-            checks.push("            for k in dict.keys { if !_pnAllowed.contains(k) { throw ValidationError.outOfRange(k, \"propertyNames\") } }".to_string());
+            checks.push("            for k in dict.keys { if !_pnAllowed.contains(k) { issues.append(JstIssue(path: \"/\" + _jstPtr(k), message: \"propertyNames\")) } }".to_string());
         }
         _ => {
-            // Generic: serialize each key as JSON string and validate against sub-schema
+            // Generic: serialize each key as JSON string and validate against
+            // sub-schema (verdict-only per key)
             let mut sub_counter = 0usize;
             let (sub_pre, pn_type) = emit_swift_sub_schema("PN", pn, defs, &mut sub_counter);
             if !sub_pre.is_empty() {
                 preamble.push_str(&sub_pre);
             }
             if pn_type != "AnyCodable" {
-                checks.push(format!("            for k in dict.keys {{ let kd = _serializeAny(k); let _ = try JSONDecoder().decode({pn_type}.self, from: kd) }}"));
+                checks.push(format!("            for k in dict.keys {{ let kd = _serializeAny(k); if (try? JSONDecoder().decode({pn_type}.self, from: kd)) == nil {{ issues.append(JstIssue(path: \"/\" + _jstPtr(k), message: \"propertyNames\")) }} }}"));
             }
         }
     }
 }
 
-/// Emit Swift guard statements for a single field's constraints.
-fn emit_guard_lines(
-    swift_name: &str,
-    optional: bool,
+/// Emit issue-collecting checks for a single field's constraints. The field
+/// value lives in an Optional local (a failed decode leaves it nil and is
+/// already recorded as an issue), so every guard uses `if let` — the checks
+/// are the same as the former throwing guards, they just push instead.
+fn emit_guard_collect_lines(
+    local: &str,
+    ptr: &str,
     guards: &[FieldGuard],
     lines: &mut Vec<String>,
 ) {
+    let cmp = |op: &str, bound: &str, lines: &mut Vec<String>| {
+        lines.push(format!(
+            "        if let v = {local}, !(v {op} {bound}) {{ issues.append(JstIssue(path: \"{ptr}\", message: \"{op} {bound}\")) }}"
+        ));
+    };
     for guard in guards {
-        let v = if optional { "v" } else { swift_name };
-
         match guard {
-            FieldGuard::Minimum(n) => {
-                let bound = format_number(*n);
-                emit_comparison(swift_name, v, optional, ">=", &bound, &format!(">= {bound}"), lines);
-            }
-            FieldGuard::Maximum(n) => {
-                let bound = format_number(*n);
-                emit_comparison(swift_name, v, optional, "<=", &bound, &format!("<= {bound}"), lines);
-            }
-            FieldGuard::ExclusiveMinimum(n) => {
-                let bound = format_number(*n);
-                emit_comparison(swift_name, v, optional, ">", &bound, &format!("> {bound}"), lines);
-            }
-            FieldGuard::ExclusiveMaximum(n) => {
-                let bound = format_number(*n);
-                emit_comparison(swift_name, v, optional, "<", &bound, &format!("< {bound}"), lines);
-            }
+            FieldGuard::Minimum(n) => cmp(">=", &format_number(*n), lines),
+            FieldGuard::Maximum(n) => cmp("<=", &format_number(*n), lines),
+            FieldGuard::ExclusiveMinimum(n) => cmp(">", &format_number(*n), lines),
+            FieldGuard::ExclusiveMaximum(n) => cmp("<", &format_number(*n), lines),
             FieldGuard::MultipleOf(n) => {
                 let bound = format_number(*n);
                 let msg = format!("must be a multiple of {bound}");
-                if optional {
-                    lines.push(format!(
-                        "        if let v = {swift_name} {{ if (Double(v) / {bound}).isInfinite {{ throw ValidationError.outOfRange(\"{swift_name}\", \"{msg}\") }}; let _mof = Double(v).remainder(dividingBy: {bound}); if _mof.isNaN || _mof.isInfinite || (abs(_mof) > 1e-9 && abs(abs(_mof) - {bound}) > 1e-9) {{ throw ValidationError.outOfRange(\"{swift_name}\", \"{msg}\") }} }}"
-                    ));
-                } else {
-                    lines.push(format!(
-                        "        if (Double({v}) / {bound}).isInfinite {{ throw ValidationError.outOfRange(\"{swift_name}\", \"{msg}\") }}"
-                    ));
-                    lines.push(format!(
-                        "        let _mof = Double({v}).remainder(dividingBy: {bound})"
-                    ));
-                    lines.push(format!(
-                        "        if _mof.isNaN || _mof.isInfinite || (abs(_mof) > 1e-9 && abs(abs(_mof) - {bound}) > 1e-9) {{ throw ValidationError.outOfRange(\"{swift_name}\", \"{msg}\") }}"
-                    ));
-                }
+                lines.push(format!(
+                    "        if let v = {local} {{ if (Double(v) / {bound}).isInfinite {{ issues.append(JstIssue(path: \"{ptr}\", message: \"{msg}\")) }} else {{ let _mof = Double(v).remainder(dividingBy: {bound}); if _mof.isNaN || _mof.isInfinite || (abs(_mof) > 1e-9 && abs(abs(_mof) - {bound}) > 1e-9) {{ issues.append(JstIssue(path: \"{ptr}\", message: \"{msg}\")) }} }} }}"
+                ));
             }
             FieldGuard::MinLength(n) => {
-                let msg = format!("length must be >= {n}");
-                if optional {
-                    lines.push(format!(
-                        "        if let v = {swift_name}, v.count < {n} {{ throw ValidationError.outOfRange(\"{swift_name}\", \"{msg}\") }}"
-                    ));
-                } else {
-                    lines.push(format!(
-                        "        if {v}.count < {n} {{ throw ValidationError.outOfRange(\"{swift_name}\", \"{msg}\") }}"
-                    ));
-                }
+                lines.push(format!(
+                    "        if let v = {local}, v.count < {n} {{ issues.append(JstIssue(path: \"{ptr}\", message: \"length must be >= {n}\")) }}"
+                ));
             }
             FieldGuard::MaxLength(n) => {
-                let msg = format!("length must be <= {n}");
-                if optional {
-                    lines.push(format!(
-                        "        if let v = {swift_name}, v.count > {n} {{ throw ValidationError.outOfRange(\"{swift_name}\", \"{msg}\") }}"
-                    ));
-                } else {
-                    lines.push(format!(
-                        "        if {v}.count > {n} {{ throw ValidationError.outOfRange(\"{swift_name}\", \"{msg}\") }}"
-                    ));
-                }
+                lines.push(format!(
+                    "        if let v = {local}, v.count > {n} {{ issues.append(JstIssue(path: \"{ptr}\", message: \"length must be <= {n}\")) }}"
+                ));
             }
             FieldGuard::Pattern(pat) => {
                 let escaped = swift_escape(pat);
-                let msg = format!("must match pattern {escaped}");
-                if optional {
-                    lines.push(format!(
-                        "        if let v = {swift_name}, v.range(of: \"{escaped}\", options: .regularExpression) == nil {{ throw ValidationError.outOfRange(\"{swift_name}\", \"{msg}\") }}"
-                    ));
-                } else {
-                    lines.push(format!(
-                        "        if {v}.range(of: \"{escaped}\", options: .regularExpression) == nil {{ throw ValidationError.outOfRange(\"{swift_name}\", \"{msg}\") }}"
-                    ));
-                }
+                lines.push(format!(
+                    "        if let v = {local}, v.range(of: \"{escaped}\", options: .regularExpression) == nil {{ issues.append(JstIssue(path: \"{ptr}\", message: \"must match pattern {escaped}\")) }}"
+                ));
             }
             FieldGuard::MinItems(n) => {
-                let msg = format!("must have at least {n} items");
-                if optional {
-                    lines.push(format!(
-                        "        if let v = {swift_name}, v.count < {n} {{ throw ValidationError.outOfRange(\"{swift_name}\", \"{msg}\") }}"
-                    ));
-                } else {
-                    lines.push(format!(
-                        "        if {v}.count < {n} {{ throw ValidationError.outOfRange(\"{swift_name}\", \"{msg}\") }}"
-                    ));
-                }
+                lines.push(format!(
+                    "        if let v = {local}, v.count < {n} {{ issues.append(JstIssue(path: \"{ptr}\", message: \"must have at least {n} items\")) }}"
+                ));
             }
             FieldGuard::MaxItems(n) => {
-                let msg = format!("must have at most {n} items");
-                if optional {
-                    lines.push(format!(
-                        "        if let v = {swift_name}, v.count > {n} {{ throw ValidationError.outOfRange(\"{swift_name}\", \"{msg}\") }}"
-                    ));
-                } else {
-                    lines.push(format!(
-                        "        if {v}.count > {n} {{ throw ValidationError.outOfRange(\"{swift_name}\", \"{msg}\") }}"
-                    ));
-                }
+                lines.push(format!(
+                    "        if let v = {local}, v.count > {n} {{ issues.append(JstIssue(path: \"{ptr}\", message: \"must have at most {n} items\")) }}"
+                ));
             }
             FieldGuard::UniqueItems => {
-                // Compare canonical JSON encodings so any Codable element works
-                let msg = "items must be unique";
-                let check = |arr_expr: &str| {
-                    format!(
-                        "        do {{ let enc = JSONEncoder(); enc.outputFormatting = [.sortedKeys]; let ser = try {arr_expr}.map {{ String(data: try enc.encode([$0]), encoding: .utf8) ?? \"\" }}; if Set(ser).count != ser.count {{ throw ValidationError.outOfRange(\"{swift_name}\", \"{msg}\") }} }}"
-                    )
-                };
-                if optional {
-                    lines.push(format!(
-                        "        if let v = {swift_name} {{\n{}\n        }}",
-                        check("v")
-                    ));
-                } else {
-                    lines.push(check(&v));
-                }
+                // Compare canonical JSON encodings so any Codable element
+                // works; every duplicate index gets its own issue.
+                lines.push(format!(
+                    "        if let v = {local} {{ let enc = JSONEncoder(); enc.outputFormatting = [.sortedKeys]; let ser = try v.map {{ String(data: try enc.encode([$0]), encoding: .utf8) ?? \"\" }}; var seen = Set<String>(); for (i, s) in ser.enumerated() {{ if !seen.insert(s).inserted {{ issues.append(JstIssue(path: \"{ptr}/\\(i)\", message: \"items must be unique\")) }} }} }}"
+                ));
             }
         }
     }
 }
 
-fn emit_comparison(
-    swift_name: &str,
-    v: &str,
-    optional: bool,
-    op: &str,
-    bound: &str,
-    msg: &str,
-    lines: &mut Vec<String>,
-) {
-    if optional {
-        lines.push(format!(
-            "        if let v = {swift_name}, !(v {op} {bound}) {{ throw ValidationError.outOfRange(\"{swift_name}\", \"{msg}\") }}"
-        ));
-    } else {
-        lines.push(format!(
-            "        if !({v} {op} {bound}) {{ throw ValidationError.outOfRange(\"{swift_name}\", \"{msg}\") }}"
-        ));
+/// When an array-typed field's wholesale decode fails, evaluate its
+/// array-level guards (min/max/unique) against the raw JSON array so the
+/// issue list stays complete (e.g. a duplicate AND a wrong-typed element are
+/// both reported). Runs only on the reject path — the decode issue is already
+/// recorded — so verdicts are unaffected.
+fn raw_array_guard_fallback(ptr: &str, swift_name: &str, guards: &[FieldGuard]) -> String {
+    let mut checks: Vec<String> = Vec::new();
+    for guard in guards {
+        match guard {
+            FieldGuard::MinItems(n) => checks.push(format!(
+                "if arr.count < {n} {{ issues.append(JstIssue(path: \"{ptr}\", message: \"must have at least {n} items\")) }}"
+            )),
+            FieldGuard::MaxItems(n) => checks.push(format!(
+                "if arr.count > {n} {{ issues.append(JstIssue(path: \"{ptr}\", message: \"must have at most {n} items\")) }}"
+            )),
+            FieldGuard::UniqueItems => checks.push(format!(
+                "var seen = Set<String>(); for (i, el) in arr.enumerated() {{ let s = String(data: _serializeAny(el), encoding: .utf8) ?? \"\"; if !seen.insert(s).inserted {{ issues.append(JstIssue(path: \"{ptr}/\\(i)\", message: \"items must be unique\")) }} }}"
+            )),
+            _ => {}
+        }
     }
+    if checks.is_empty() {
+        return String::new();
+    }
+    format!(
+        "; if let raw = try? container.decode(AnyCodable.self, forKey: .{swift_name}), let arr = raw.value as? [Any] {{ {} }}",
+        checks.join("; ")
+    )
 }
 
 fn is_swift_keyword(s: &str) -> bool {
@@ -2350,7 +2381,14 @@ mod tests {
         assert!(out.contains("\n    var id: String"), "{out}");
         assert!(out.contains("\n    var quantity: Int"), "{out}");
         assert!(out.contains("\n    var tags: [String]?"), "{out}");
-        assert!(!out.contains("\n    let "), "{out}");
+        // Schema stored properties are all `var`; 4-space `let`s inside the
+        // helper snippets (JstIssue fields, helper-func locals) are exempt
+        // from --mutable by design, so check the schema struct body only.
+        let struct_body = out
+            .split("struct OrderItem: Codable")
+            .nth(1)
+            .expect("root struct emitted");
+        assert!(!struct_body.contains("\n    let "), "{struct_body}");
         // Validation APIs are emitted regardless of mutability.
         assert!(out.contains("protocol OrderItemValidatable: Codable {"), "{out}");
     }
@@ -2378,5 +2416,66 @@ mod tests {
         assert!(out.contains("struct Sample: Codable, SampleValidatable {"), "{out}");
         assert!(out.contains("init(_ value: Int) throws {"), "{out}");
         assert!(out.contains("        self.value = value\n        try validate()"), "{out}");
+    }
+
+    #[test]
+    fn object_init_collects_complete_issue_list() {
+        let out = emit(order_item_schema(), "OrderItem", &EmitOptions::default());
+        // Complete-issues error type is inlined (file-private) and thrown once
+        // with everything collected.
+        assert!(out.contains("private struct JstIssue {"), "{out}");
+        assert!(out.contains("private struct JstValidationError: Error, LocalizedError {"), "{out}");
+        assert!(out.contains("        var issues: [JstIssue] = []"), "{out}");
+        assert!(out.contains("        if !issues.isEmpty { throw JstValidationError(issues: issues) }"), "{out}");
+        // Fields decode into locals via do/catch so one failure cannot stop
+        // the others from being checked; assignment happens after the throw.
+        assert!(out.contains("do { _jst_id = try container.decode(String.self, forKey: .id) } catch { issues.append(contentsOf: _jstIssues(error, at: \"/id\", containerBase: _jstBase)) }"), "{out}");
+        assert!(out.contains("do { _jst_quantity = try container.decode(Int.self, forKey: .quantity) } catch { issues.append(contentsOf: _jstIssues(error, at: \"/quantity\", containerBase: _jstBase)) }"), "{out}");
+        assert!(out.contains("        self.id = _jst_id!"), "{out}");
+        // Guards push instead of throwing, with JSON-Pointer paths.
+        assert!(out.contains("if let v = _jst_quantity, !(v >= 1) { issues.append(JstIssue(path: \"/quantity\", message: \">= 1\")) }"), "{out}");
+        // Unexpected keys are all reported.
+        assert!(out.contains("issues.append(JstIssue(path: \"/\" + _jstPtr(key.stringValue), message: \"unexpected property\"))"), "{out}");
+    }
+
+    #[test]
+    fn missing_required_keys_are_all_reported() {
+        // Both required fields decode inside their own do/catch: a
+        // keyNotFound for one becomes "required property is missing" and the
+        // other is still checked (the snippet renders the message).
+        let out = emit(order_item_schema(), "OrderItem", &EmitOptions::default());
+        let field_catches = out.matches("containerBase: _jstBase))").count();
+        assert!(field_catches >= 3, "each field needs its own catch: {out}");
+        assert!(out.contains("message: \"required property is missing\""), "{out}");
+    }
+
+    #[test]
+    fn string_wrapper_collects_all_constraint_failures() {
+        let out = emit(
+            json!({"type": "string", "minLength": 3, "pattern": "^a"}),
+            "Sample",
+            &EmitOptions::default(),
+        );
+        // Both failures are pushed; a single complete-issues error is thrown.
+        assert!(out.contains("if value.count < 3 { issues.append(JstIssue(path: \"\", message: \"length must be >= 3\")) }"), "{out}");
+        assert!(out.contains("if value.range(of: \"^a\", options: .regularExpression) == nil { issues.append(JstIssue(path: \"\", message: \"must match pattern\")) }"), "{out}");
+        assert_eq!(out.matches("throw JstValidationError(issues: issues)").count(), 1, "{out}");
+    }
+
+    #[test]
+    fn shared_mode_reports_jst_error_need() {
+        let converted = Converter::convert(&order_item_schema()).unwrap();
+        let options = EmitOptions {
+            helpers: Some(SharedHelpers::new("JstHelpers.swift")),
+            ..EmitOptions::default()
+        };
+        let (out, needs) = SwiftEmitter.emit_collecting(&converted, "OrderItem", &options);
+        assert!(needs.contains("jst_error"));
+        // Error type lives (internal, unprefixed) in the helpers file only.
+        assert!(!out.contains("struct JstValidationError"), "{out}");
+        let helpers = SwiftEmitter.helpers_content_for(&needs).unwrap();
+        assert!(helpers.contains("struct JstValidationError: Error, LocalizedError {"), "{helpers}");
+        assert!(!helpers.contains("private struct JstValidationError"), "{helpers}");
+        assert!(helpers.contains("func _jstIssues("), "{helpers}");
     }
 }

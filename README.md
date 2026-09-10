@@ -118,6 +118,23 @@ Generated types validate at decode time, and every validating target also expose
 
 One caveat by design: **plain encoding does not validate** (`JSONEncoder().encode`, kotlinx `encodeToString`, serde serialization). `validate()` is implemented by round-tripping through the validating decoder, so hooking the raw encode path would recurse; use the `validatedJSONData()` / `toValidatedJson()` / `to_validated_json()` helpers when you need serialize-only-if-valid.
 
+**Error reporting is complete, not first-failure**: every validating target reports the full list of failed constraints with paths — Zod natively (`ZodError.issues`), Pydantic natively (`ValidationError.errors()`), and the generated Swift/Kotlin/Rust types via a `JstIssue { path, message }` list (JSON-Pointer paths, e.g. `/quantity: must be >= 1; /tags/1: duplicate item; /extra: unexpected property`) carried by `JstError` (Rust), `JstValidationError` (Swift), and `JstValidationException` (Kotlin). Composition keywords (`anyOf`/`oneOf`) report a single match/no-match verdict, and type mismatches short-circuit only their own subtree.
+
+Consuming the issues (Kotlin shown — decode, `validate()` and `toValidatedJson()` all throw the same exception; in Rust, `validate()` / `to_validated_json()` return `Result<_, JstError>` with the same `issues` vector, and serde decode errors surface the joined message):
+
+```kotlin
+try {
+    Json.decodeFromString<OrderItem>(payload)
+} catch (e: JstValidationException) {   // extends SerializationException — existing catch sites keep working
+    for ((path, message) in e.issues) println("$path: $message")
+    // /quantity: must be >= 1
+    // /tags/1: duplicate item
+    // /extra: unexpected property
+}
+```
+
+`e.message` joins all issues (`"; "`-separated, root-level issues message-only). In collection mode the Kotlin error classes are shared from `jst.helpers`; in single-file mode they are declared per file as `_{RootType}JstIssue` / `_{RootType}JstValidationException`. Plain `@Serializable data class` shapes with no constraint checks keep kotlinx's native errors.
+
 ## Testing
 
 ```bash
