@@ -26,6 +26,22 @@ fun main() {
         }
     }
 
+    // Zod-style complete issues: one exception must list EVERY failed
+    // constraint (path: message, "; "-separated), not just the first.
+    val adversarial = """{"id":"a","quantity":0,"tags":["x","x"],"extra":true}"""
+    val multiMsg = try {
+        json.decodeFromString<OrderItem>(adversarial)
+        ""
+    } catch (e: Exception) {
+        e.message ?: ""
+    }
+    for (fragment in listOf("/quantity: must be >= 1", "/extra: unexpected property")) {
+        if (!multiMsg.contains(fragment)) {
+            ok = false
+            println("MISMATCH: multi-issue message missing '" + fragment + "': " + multiMsg)
+        }
+    }
+
     // Typed construction is unvalidated by design; validate() /
     // toValidatedJson() round-trip through the serializer explicitly.
     val valid = OrderItem(id = "a", quantity = 1)

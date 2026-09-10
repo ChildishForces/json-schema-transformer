@@ -18,6 +18,29 @@ for (payload, expected) in cases {
     }
 }
 
+// Complete-issues validation (Zod-style): one decode error carries EVERY
+// failure as a JSON-Pointer + message pair, not just the first.
+do {
+    _ = try JSONDecoder().decode(
+        OrderItem.self,
+        from: #"{"id":7,"quantity":0,"tags":["x","x",5],"extra":true}"#.data(using: .utf8)!
+    )
+    ok = false
+    print("MISMATCH: adversarial payload decoded")
+} catch {
+    let desc = (error as? LocalizedError)?.errorDescription ?? "\(error)"
+    for fragment in [
+        "/extra: unexpected property",
+        "/id: expected String",
+        "/quantity: >= 1",
+        "/tags/2: expected String",
+        "/tags/1: items must be unique",
+    ] where !desc.contains(fragment) {
+        ok = false
+        print("MISMATCH: issue list missing \(fragment): \(desc)")
+    }
+}
+
 // Manual construction: the throwing initializer validates on the spot.
 do {
     let item = try OrderItem(id: "a", quantity: 2)

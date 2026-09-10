@@ -43,6 +43,13 @@ impl Emitter for KotlinEmitter {
             s.push_str(VALIDATABLE_KT);
             s.push('\n');
         }
+        if needs.contains("error") {
+            // JstIssue/JstValidationException stay public on purpose: user
+            // code catches the exception type and inspects `issues`. Only the
+            // pointer-escape helper is internalized.
+            s.push_str(&internalize(ERROR_KT));
+            s.push('\n');
+        }
         if needs.contains("canonicalize") {
             s.push_str(&internalize(CANONICALIZE_KT));
             s.push('\n');
@@ -66,7 +73,7 @@ impl Emitter for KotlinEmitter {
 
     fn helpers_content(&self) -> Option<String> {
         let mut all = HelperSet::default();
-        for n in ["validatable", "canonicalize", "lenient_json", "jsi_eq", "jsi"] {
+        for n in ["validatable", "error", "canonicalize", "lenient_json", "jsi_eq", "jsi"] {
             all.insert(n);
         }
         self.helpers_content_for(&all)
@@ -105,8 +112,22 @@ impl KotlinEmitter {
         } else {
             format!("_{pascal}JstValidatable")
         };
+        // Names of the issue/exception classes as visible from this file.
+        // Top-level classes are package-scoped on the JVM, so inline mode
+        // mangles them per file (like the JSI classes); shared mode uses the
+        // canonical names from `jst.helpers`.
+        let (issue, exc) = if shared {
+            ("JstIssue".to_string(), "JstValidationException".to_string())
+        } else {
+            (
+                format!("_{pascal}JstIssue"),
+                format!("_{pascal}JstValidationException"),
+            )
+        };
         let gopts = GenOptions {
             iface: &iface,
+            issue: &issue,
+            exc: &exc,
             mutable: options.mutable,
         };
 
@@ -156,6 +177,11 @@ impl KotlinEmitter {
         // serializer via the reified StringFormat extensions.
         let needs_validatable = body.contains("JstValidatable");
         let needs_encode_to_element = body.contains(".encodeToJsonElement(");
+        // Zod-style issue collection: any wrapper serializer that validates
+        // references the issue/exception classes (mangled names still contain
+        // the canonical substrings).
+        let needs_error = body.contains("JstIssue") || body.contains("JstValidationException");
+        let needs_ptr = body.contains("_jstPtr(");
 
         if needs_serial_name {
             out.push_str("import kotlinx.serialization.SerialName\n");
@@ -204,6 +230,14 @@ impl KotlinEmitter {
                 needs.insert("validatable");
                 out.push_str("import jst.helpers._JstValidatable\n");
             }
+            if needs_error {
+                needs.insert("error");
+                out.push_str("import jst.helpers.JstIssue\n");
+                out.push_str("import jst.helpers.JstValidationException\n");
+                if needs_ptr {
+                    out.push_str("import jst.helpers._jstPtr\n");
+                }
+            }
             // Reference helpers declared once in the companion file's fixed
             // `jst.helpers` package (canonical names — no per-file mangling).
             if needs_canonicalize {
@@ -229,6 +263,16 @@ impl KotlinEmitter {
         if !shared {
             if needs_validatable {
                 out.push_str(&VALIDATABLE_KT.replace("_JstValidatable", &iface));
+                out.push('\n');
+            }
+            if needs_error {
+                // Class names are mangled per file (JVM package scoping);
+                // `_jstPtr` stays `private`, which is file-scoped for
+                // top-level functions, so it never collides across files.
+                let err = ERROR_KT
+                    .replace("JstValidationException", &exc)
+                    .replace("JstIssue", &issue);
+                out.push_str(&err);
                 out.push('\n');
             }
             if needs_canonicalize {
@@ -299,10 +343,40 @@ const VALIDATABLE_KT: &str = concat!(
     "}\n",
 );
 
+/// Zod-style validation error carrier. Wrapper serializers collect EVERY
+/// failed constraint into `issues` (path = RFC 6901 JSON Pointer, "" = root)
+/// and throw one exception at the end instead of failing on the first check.
+///
+/// Both classes are deliberately public: user code catches the exception type
+/// and inspects `issues`. Extending SerializationException keeps existing
+/// catch sites (and the conformance harness) working unchanged. Inline mode
+/// mangles the class names per file (`JstIssue` → `_{Pascal}JstIssue`); the
+/// `private` pointer-escape helper is file-scoped and needs no mangling.
+const ERROR_KT: &str = concat!(
+    "/** A single validation failure: a JSON Pointer (RFC 6901) to the offending\n",
+    " *  location (\"\" = the whole value) and a human-readable message. */\n",
+    "data class JstIssue(val path: String, val message: String)\n",
+    "\n",
+    "/** Validation error carrying every failed constraint, not just the first.\n",
+    " *  The message renders all issues, \"; \"-separated, each as `path: message`\n",
+    " *  (root issues message-only). */\n",
+    "class JstValidationException(val issues: List<JstIssue>) :\n",
+    "    kotlinx.serialization.SerializationException(\n",
+    "        issues.joinToString(\"; \") { if (it.path.isEmpty()) it.message else it.path + \": \" + it.message }\n",
+    "    )\n",
+    "\n",
+    "/** Escape a key for use as a JSON Pointer token (RFC 6901: `~` → `~0`, `/` → `~1`). */\n",
+    "private fun _jstPtr(segment: String): String = segment.replace(\"~\", \"~0\").replace(\"/\", \"~1\")\n",
+);
+
 /// Per-file generation options threaded through the definition emitters.
 struct GenOptions<'a> {
     /// Name of the validation interface as visible from this file.
     iface: &'a str,
+    /// Name of the issue data class as visible from this file.
+    issue: &'a str,
+    /// Name of the validation exception class as visible from this file.
+    exc: &'a str,
     /// Emit `var` instead of `val` for stored properties.
     mutable: bool,
 }
@@ -621,7 +695,8 @@ fn emit_wrapper(name: &str, ir: &SchemaIr, defs: &[DefEntry], prefix: &str, coun
     *counter += 1;
     let ser_name = format!("{name}Ser");
 
-    let validation = emit_validation(inner, defs, prefix, counter);
+    let ctx = Ctx { prefix, issue: gopts.issue, exc: gopts.exc };
+    let validation = emit_validation(inner, &ctx);
 
     let mut out = String::new();
 
@@ -640,7 +715,18 @@ fn emit_wrapper(name: &str, ir: &SchemaIr, defs: &[DefEntry], prefix: &str, coun
     if is_nullable {
         out.push_str(&format!("        if (el is JsonNull) return {name}(el)\n"));
     }
-    out.push_str(&validation);
+    if !validation.is_empty() {
+        // Zod-style: run every check, collecting issues, then throw once.
+        out.push_str(&format!(
+            "        val issues = mutableListOf<{}>()\n        val path = \"\"\n",
+            gopts.issue
+        ));
+        out.push_str(&validation);
+        out.push_str(&format!(
+            "        if (issues.isNotEmpty()) throw {}(issues)\n",
+            gopts.exc
+        ));
+    }
     out.push_str(&format!("        return {name}(el)\n"));
     out.push_str("    }\n");
     out.push_str(&format!(
@@ -754,8 +840,60 @@ fn unwrap_modifiers(ir: &SchemaIr) -> &SchemaIr {
 }
 
 // ── Validation code generation ──────────────────────────────────────────────
+//
+// `emit_validation` returns Kotlin *statements* over three in-scope bindings —
+// `el: JsonElement`, a JSON-Pointer `path: String` ("" = root), and
+// `issues: MutableList<JstIssue>` — that push EVERY failed constraint
+// (Zod-style), not just the first. Type mismatches short-circuit only their
+// own subtree (a `return@run` inside the arm's own `run {}` scope; checking
+// minLength of a non-string is meaningless), everything else accumulates.
+// Verdicts stay equivalent to the previous throwing code (issues non-empty
+// <=> the old `require(...)` chain threw), so accept/reject decisions across
+// the conformance suite are unchanged. Composition members (anyOf/oneOf) use
+// bool verdicts and report a single issue — only match/no-match is meaningful
+// there — and the embedded JSI interpreter stays verdict-only likewise.
+//
+// Boundary rule: plain `@Serializable data class` shapes with no custom
+// serializer keep native kotlinx errors — there is nothing to collect there.
+// `validate()`/`toValidatedJson()` surface JstValidationException through the
+// serializer round-trip automatically.
 
-fn emit_validation(ir: &SchemaIr, defs: &[DefEntry], prefix: &str, counter: &mut usize) -> String {
+/// Generation context threaded through the validation emitters.
+struct Ctx<'a> {
+    prefix: &'a str,
+    /// Issue class name as visible from this file (mangled in inline mode).
+    issue: &'a str,
+    /// Exception class name as visible from this file.
+    exc: &'a str,
+}
+
+impl Ctx<'_> {
+    /// `issues.add(JstIssue(<path expr>, "<msg>"))` statement.
+    fn push(&self, path_expr: &str, msg: &str) -> String {
+        format!(
+            "issues.add({}({}, \"{}\"))",
+            self.issue,
+            path_expr,
+            escape_string(msg)
+        )
+    }
+}
+
+/// Emit-side JSON Pointer token escaping for statically known keys
+/// (RFC 6901: `~` → `~0`, `/` → `~1`).
+fn ptr_seg(key: &str) -> String {
+    key.replace('~', "~0").replace('/', "~1")
+}
+
+/// Kotlin expression for the child path of a statically known object key.
+fn child_path(key: &str) -> String {
+    format!("path + \"/{}\"", escape_string(&ptr_seg(key)))
+}
+
+/// Kotlin expression for the child path of a dynamic key `k` (runtime-escaped).
+const DYN_KEY_PATH: &str = "path + \"/\" + _jstPtr(k)";
+
+fn emit_validation(ir: &SchemaIr, ctx: &Ctx) -> String {
     match ir {
         SchemaIr::Interpreted { schema, remotes } => {
             let schema_json =
@@ -769,16 +907,20 @@ fn emit_validation(ir: &SchemaIr, defs: &[DefEntry], prefix: &str, counter: &mut
                     .unwrap_or_else(|_| "{}".to_string())
             };
             format!(
-                "        val _s = kotlinx.serialization.json.Json.parseToJsonElement(\"{}\")\n        val _r = kotlinx.serialization.json.Json.parseToJsonElement(\"{}\") as JsonObject\n        require(_jsiValidate(_s, _r, el)) {{ \"does not match schema\" }}\n",
+                "        run {{\n            val _s = kotlinx.serialization.json.Json.parseToJsonElement(\"{}\")\n            val _r = kotlinx.serialization.json.Json.parseToJsonElement(\"{}\") as JsonObject\n            if (!_jsiValidate(_s, _r, el)) {}\n        }}\n",
                 escape_string(&schema_json),
-                escape_string(&remotes_json)
+                escape_string(&remotes_json),
+                ctx.push(
+                    "path",
+                    "does not match the schema (checked by the embedded draft 2020-12 validator)"
+                )
             )
         }
         SchemaIr::Describe(inner, _) | SchemaIr::Default(inner, _) | SchemaIr::Optional(inner) => {
-            emit_validation(inner, defs, prefix, counter)
+            emit_validation(inner, ctx)
         }
         SchemaIr::Nullable(inner) => {
-            let v = emit_validation(inner, defs, prefix, counter);
+            let v = emit_validation(inner, ctx);
             if v.is_empty() {
                 String::new()
             } else {
@@ -794,300 +936,246 @@ fn emit_validation(ir: &SchemaIr, defs: &[DefEntry], prefix: &str, counter: &mut
                 .map(|c| format!("\"{}\"", escape_string(c)))
                 .collect();
             format!(
-                "        require(el is JsonPrimitive && el.isString && el.content in setOf<String>({})) {{ \"must be one of the allowed values\" }}\n",
-                allowed.join(", ")
+                "        if (!(el is JsonPrimitive && el.isString && el.content in setOf<String>({}))) {}\n",
+                allowed.join(", "),
+                ctx.push("path", "must be one of the allowed values")
             )
         }
         SchemaIr::Integer(c) => {
-            let mut checks = Vec::new();
-            checks.push(
-                "        require(el is JsonPrimitive && !el.isString && el.booleanOrNull == null) { \"must be an integer, not string or boolean\" }"
-                    .to_string(),
-            );
-            checks.push(
-                "        val v = (el as JsonPrimitive).longOrNull ?: (el as JsonPrimitive).doubleOrNull?.let { if (it == it.toLong().toDouble()) it.toLong() else null } ?: error(\"must be an integer\")"
-                    .to_string(),
-            );
-            emit_number_checks(&mut checks, c, "v", true);
-            checks.join("\n") + "\n"
+            let mut out = String::new();
+            out.push_str("        run {\n");
+            out.push_str(&format!(
+                "            if (!(el is JsonPrimitive && !el.isString && el.booleanOrNull == null)) {{ {}; return@run }}\n",
+                ctx.push("path", "must be an integer")
+            ));
+            out.push_str("            val v = (el as JsonPrimitive).longOrNull ?: (el as JsonPrimitive).doubleOrNull?.let { if (it == it.toLong().toDouble()) it.toLong() else null }\n");
+            out.push_str(&format!(
+                "            if (v == null) {{ {}; return@run }}\n",
+                ctx.push("path", "must be an integer")
+            ));
+            emit_number_pushes(&mut out, c, "v", ctx);
+            out.push_str("        }\n");
+            out
         }
         SchemaIr::Number(c) => {
-            let mut checks = Vec::new();
-            checks.push(
-                "        require(el is JsonPrimitive && !el.isString && el.booleanOrNull == null) { \"must be a number, not string or boolean\" }"
-                    .to_string(),
-            );
-            checks.push(
-                "        val v = (el as JsonPrimitive).doubleOrNull ?: error(\"must be a number\")"
-                    .to_string(),
-            );
-            emit_number_checks(&mut checks, c, "v", false);
-            checks.join("\n") + "\n"
+            let mut out = String::new();
+            out.push_str("        run {\n");
+            out.push_str(&format!(
+                "            if (!(el is JsonPrimitive && !el.isString && el.booleanOrNull == null)) {{ {}; return@run }}\n",
+                ctx.push("path", "must be a number")
+            ));
+            out.push_str("            val v = (el as JsonPrimitive).doubleOrNull\n");
+            out.push_str(&format!(
+                "            if (v == null) {{ {}; return@run }}\n",
+                ctx.push("path", "must be a number")
+            ));
+            emit_number_pushes(&mut out, c, "v", ctx);
+            out.push_str("        }\n");
+            out
         }
-        SchemaIr::Boolean => {
-            "        require(el is JsonPrimitive && !el.isString && el.booleanOrNull != null) { \"must be a boolean\" }\n"
-                .to_string()
-        }
+        SchemaIr::Boolean => format!(
+            "        if (!(el is JsonPrimitive && !el.isString && el.booleanOrNull != null)) {}\n",
+            ctx.push("path", "must be a boolean")
+        ),
         SchemaIr::String(c) => {
-            let mut checks = Vec::new();
-            checks.push(
-                "        require(el is JsonPrimitive && el.isString) { \"must be a string\" }"
-                    .to_string(),
-            );
-            checks.push("        val v = el.content".to_string());
+            if c.min_length.is_none() && c.max_length.is_none() && c.pattern.is_none() {
+                return format!(
+                    "        if (!(el is JsonPrimitive && el.isString)) {}\n",
+                    ctx.push("path", "must be a string")
+                );
+            }
+            let mut out = String::new();
+            out.push_str("        run {\n");
+            out.push_str(&format!(
+                "            if (!(el is JsonPrimitive && el.isString)) {{ {}; return@run }}\n",
+                ctx.push("path", "must be a string")
+            ));
+            out.push_str("            val v = (el as JsonPrimitive).content\n");
             if let Some(min) = c.min_length {
-                checks.push(format!("        require(v.codePointCount(0, v.length) >= {min}) {{ \"minLength\" }}"));
-            }
-            if let Some(max) = c.max_length {
-                checks.push(format!("        require(v.codePointCount(0, v.length) <= {max}) {{ \"maxLength\" }}"));
-            }
-            if let Some(ref pat) = c.pattern {
-                checks.push(format!(
-                    "        require(Regex(\"{}\").containsMatchIn(v)) {{ \"pattern\" }}",
-                    escape_string(&translate_pattern(pat))
+                out.push_str(&format!(
+                    "            if (!(v.codePointCount(0, v.length) >= {min})) {}\n",
+                    ctx.push("path", &format!("must be at least {min} characters"))
                 ));
             }
-            checks.join("\n") + "\n"
+            if let Some(max) = c.max_length {
+                out.push_str(&format!(
+                    "            if (!(v.codePointCount(0, v.length) <= {max})) {}\n",
+                    ctx.push("path", &format!("must be at most {max} characters"))
+                ));
+            }
+            if let Some(ref pat) = c.pattern {
+                out.push_str(&format!(
+                    "            if (!Regex(\"{}\").containsMatchIn(v)) {}\n",
+                    escape_string(&translate_pattern(pat)),
+                    ctx.push("path", &format!("must match pattern {pat}"))
+                ));
+            }
+            out.push_str("        }\n");
+            out
         }
-        SchemaIr::Null => {
-            "        require(el is JsonNull) { \"must be null\" }\n".to_string()
-        }
+        SchemaIr::Null => format!(
+            "        if (el !is JsonNull) {}\n",
+            ctx.push("path", "must be null")
+        ),
         SchemaIr::Any | SchemaIr::Unknown => String::new(), // accept anything
-        SchemaIr::Never => {
-            "        error(\"schema rejects all values\")\n".to_string()
+        SchemaIr::Never => format!("        {}\n", ctx.push("path", "schema rejects all values")),
+        SchemaIr::Literal(lit) => {
+            let msg = match lit {
+                LiteralValue::Bool(b) => format!("must equal {b}"),
+                LiteralValue::Integer(i) => format!("must equal {i}"),
+                LiteralValue::Number(n) => format!("must equal {}", format_msg_number(*n)),
+                LiteralValue::String(s) => format!("must equal \"{s}\""),
+                LiteralValue::Null => "must be null".to_string(),
+            };
+            format!(
+                "        if (!{}) {}\n",
+                emit_literal_match(lit),
+                ctx.push("path", &msg)
+            )
         }
-        SchemaIr::Literal(lit) => emit_literal_check(lit),
         SchemaIr::ConstEqual(val) => {
             let json_str = serde_json::to_string(val).unwrap_or_else(|_| "null".to_string());
-            let escaped = escape_string(&json_str);
             format!(
-                "        val expected = kotlinx.serialization.json.Json.parseToJsonElement(\"{}\")\n        require(_jsiEq(el, expected)) {{ \"must equal const value\" }}\n",
-                escaped
+                "        run {{\n            val expected = kotlinx.serialization.json.Json.parseToJsonElement(\"{}\")\n            if (!_jsiEq(el, expected)) {}\n        }}\n",
+                escape_string(&json_str),
+                ctx.push("path", "must equal the const value")
             )
         }
         SchemaIr::MixedEnum(lits) => {
             let checks: Vec<String> = lits.iter().map(|l| emit_literal_match(l)).collect();
-            let condition = checks.join(" || ");
             format!(
-                "        require({condition}) {{ \"must be one of the allowed values\" }}\n"
+                "        if (!({})) {}\n",
+                checks.join(" || "),
+                ctx.push("path", "must be one of the allowed values")
             )
         }
         SchemaIr::ComplexEnum(vals) => {
             let json_str = serde_json::to_string(vals).unwrap_or_else(|_| "[]".to_string());
-            let escaped = escape_string(&json_str);
             format!(
-                "        val allowed = kotlinx.serialization.json.Json.parseToJsonElement(\"{escaped}\") as JsonArray\n        require(allowed.any {{ _jsiEq(el, it) }}) {{ \"must be one of the allowed values\" }}\n"
+                "        run {{\n            val allowed = kotlinx.serialization.json.Json.parseToJsonElement(\"{}\") as JsonArray\n            if (!allowed.any {{ _jsiEq(el, it) }}) {}\n        }}\n",
+                escape_string(&json_str),
+                ctx.push("path", "must be one of the allowed values")
             )
         }
-        SchemaIr::Array(arr) => emit_array_validation(arr, defs, prefix, counter),
-        SchemaIr::Tuple(tuple) => emit_tuple_validation(tuple, defs, prefix, counter),
-        SchemaIr::TypeGuarded(guards) => emit_type_guarded_validation(guards, defs, prefix, counter),
-        SchemaIr::Not { base: _, not_schema } => {
-            let not_check = emit_not_check(not_schema, defs, prefix, counter);
-            format!("{not_check}")
-        }
+        SchemaIr::Array(arr) => emit_array_validation(arr, ctx),
+        SchemaIr::Tuple(tuple) => emit_tuple_validation(tuple, ctx),
+        SchemaIr::TypeGuarded(guards) => emit_type_guarded_validation(guards, ctx),
+        SchemaIr::Not { base: _, not_schema } => emit_not_check(not_schema, ctx),
         SchemaIr::Conditional { base: _, if_schema, then_schema, else_schema } => {
-            emit_conditional_check(if_schema, then_schema.as_deref(), else_schema.as_deref(), defs, prefix, counter)
+            emit_conditional_check(if_schema, then_schema.as_deref(), else_schema.as_deref(), ctx)
         }
-        SchemaIr::Union(members) if members.len() > 1 => {
-            emit_union_check(members, defs, prefix, counter, false)
-        }
+        SchemaIr::Union(members) if members.len() > 1 => emit_union_check(members, ctx, false),
         SchemaIr::ExclusiveUnion(members) if members.len() > 1 => {
-            emit_union_check(members, defs, prefix, counter, true)
+            emit_union_check(members, ctx, true)
         }
         SchemaIr::Intersection(members) if members.len() == 1 => {
-            emit_validation(&members[0], defs, prefix, counter)
+            emit_validation(&members[0], ctx)
         }
         SchemaIr::Intersection(members) if members.len() > 1 => {
             // Wrap each member in `run { }` so local vals (v, obj, arr, known…)
             // declared by one member's checks don't conflict with the next.
+            // allOf accumulates every member's issues; type-mismatch
+            // `return@run` guards bind to each arm's own inner scope.
             let mut checks = String::new();
             for member in members {
-                let v = emit_validation(member, defs, prefix, counter);
+                let v = emit_validation(member, ctx);
                 if v.is_empty() {
                     continue;
                 }
-                checks.push_str(&format!("        run {{\n    {}\n        }}\n", v.trim_end().replace('\n', "\n    ")));
+                checks.push_str(&format!(
+                    "        run {{\n    {}\n        }}\n",
+                    v.trim_end().replace('\n', "\n    ")
+                ));
             }
             checks
         }
         SchemaIr::Record(rec) => {
-            let mut checks = String::new();
-            checks.push_str("        require(el is JsonObject) { \"must be an object\" }\n");
-            if !matches!(rec.value.as_ref(), SchemaIr::Any | SchemaIr::Unknown) {
-                // Validate each value
-                let val_check = emit_inline_check(&rec.value, "v", defs, prefix);
-                if !val_check.is_empty() {
-                    checks.push_str(&format!(
-                        "        for ((_, v) in el.jsonObject) {{ {} }}\n",
-                        val_check
-                    ));
-                }
+            let val_check = if matches!(rec.value.as_ref(), SchemaIr::Any | SchemaIr::Unknown) {
+                String::new()
+            } else {
+                emit_inline_check(&rec.value, "v", DYN_KEY_PATH, ctx)
+            };
+            if val_check.is_empty() {
+                format!(
+                    "        if (el !is JsonObject) {}\n",
+                    ctx.push("path", "must be an object")
+                )
+            } else {
+                format!(
+                    "        run {{\n            if (el !is JsonObject) {{ {}; return@run }}\n            for ((k, v) in el.jsonObject) {{ {} }}\n        }}\n",
+                    ctx.push("path", "must be an object"),
+                    val_check
+                )
             }
-            checks
         }
         SchemaIr::Object(obj) => {
-            let mut checks = Vec::new();
-            checks.push("        require(el is JsonObject) { \"must be an object\" }".to_string());
-            checks.push("        val obj = el.jsonObject".to_string());
-            for (k, f) in &obj.fields {
-                if f.required {
-                    checks.push(format!(
-                        "        require(\"{}\" in obj) {{ \"required: {}\" }}",
-                        escape_string(k), escape_string(k)
-                    ));
-                }
-                let field_check = emit_inline_check(&f.schema, &format!("obj[\"{}\"]!!", escape_string(k)), defs, prefix);
-                if !field_check.is_empty() && !matches!(&f.schema, SchemaIr::Any | SchemaIr::Unknown) {
-                    checks.push(format!(
-                        "        if (\"{}\" in obj) {{ {} }}",
-                        escape_string(k), field_check
-                    ));
-                }
-            }
-            if let Some(min) = obj.min_properties {
-                checks.push(format!("        require(obj.size >= {min}) {{ \"minProperties\" }}"));
-            }
-            if let Some(max) = obj.max_properties {
-                checks.push(format!("        require(obj.size <= {max}) {{ \"maxProperties\" }}"));
-            }
-            // patternProperties + additionalProperties interaction
-            if !obj.pattern_properties.is_empty() {
-                let known: Vec<String> = obj.fields.keys().map(|k| format!("\"{}\"", escape_string(k))).collect();
-                checks.push("        for ((k, v) in obj) {".to_string());
-                checks.push(format!("            var matched = setOf<String>({}).contains(k)", known.join(", ")));
-                for (pattern, pp_schema) in &obj.pattern_properties {
-                    let pp_check = emit_inline_check(pp_schema, "v", defs, prefix);
-                    if !pp_check.is_empty() {
-                        checks.push(format!(
-                            "            if (Regex(\"{}\").containsMatchIn(k)) {{ matched = true; {} }}",
-                            escape_string(&translate_pattern(pattern)), pp_check
-                        ));
-                    } else {
-                        checks.push(format!(
-                            "            if (Regex(\"{}\").containsMatchIn(k)) {{ matched = true }}",
-                            escape_string(&translate_pattern(pattern))
-                        ));
-                    }
-                }
-                if matches!(obj.additional_properties, AdditionalProperties::Forbidden) {
-                    checks.push("            require(matched) { \"unexpected property: $k\" }".to_string());
-                } else if let AdditionalProperties::Schema(ap) = &obj.additional_properties {
-                    let ap_check = emit_inline_check(ap, "v", defs, prefix);
-                    if !ap_check.is_empty() {
-                        checks.push(format!("            if (!matched) {{ {} }}", ap_check));
-                    }
-                }
-                checks.push("        }".to_string());
-            } else if matches!(obj.additional_properties, AdditionalProperties::Forbidden) {
-                let known: Vec<String> = obj.fields.keys().map(|k| format!("\"{}\"", escape_string(k))).collect();
-                checks.push(format!(
-                    "        val known = setOf<String>({})",
-                    known.join(", ")
-                ));
-                checks.push("        for (k in obj.keys) { require(k in known) { \"unexpected property: $k\" } }".to_string());
-            } else if let AdditionalProperties::Schema(ap) = &obj.additional_properties {
-                let known: Vec<String> = obj.fields.keys().map(|k| format!("\"{}\"", escape_string(k))).collect();
-                let ap_check = emit_inline_check(ap, "v", defs, prefix);
-                if !ap_check.is_empty() {
-                    checks.push(format!(
-                        "        val _known = setOf<String>({})\n        for ((k, v) in obj) {{ if (k !in _known) {{ {} }} }}",
-                        known.join(", "), ap_check
-                    ));
-                }
-            }
-            // propertyNames
-            if let Some(pn) = &obj.property_names {
-                emit_property_names_checks(pn, &mut checks, "        ", defs, prefix);
-            }
-            // dependentRequired
-            for (prop, required) in &obj.dependent_required {
-                for r in required {
-                    checks.push(format!(
-                        "        if (\"{}\" in obj) require(\"{}\" in obj) {{ \"dependentRequired\" }}",
-                        escape_string(prop), escape_string(r)
-                    ));
-                }
-            }
-            // dependentSchemas
-            for (prop, dep_schema) in &obj.dependent_schemas {
-                let dep_check = emit_match_expression(dep_schema, "el", defs, prefix);
-                if dep_check != "true" {
-                    checks.push(format!(
-                        "        if (\"{}\" in obj) {{ require({}) {{ \"dependentSchemas\" }} }}",
-                        escape_string(prop), dep_check
-                    ));
-                }
-            }
-            // NOTE: additionalProperties-with-schema is fully handled in the
-            // pattern-properties/else-if chain above; emitting it again here
-            // used to produce a conflicting duplicate `val _known`.
-            if checks.len() <= 2 {
-                // Only the require(el is JsonObject) + val obj — no real validation
-                "        require(el is JsonObject) { \"must be an object\" }\n".to_string()
+            let body = emit_object_checks(obj, ctx, "            ");
+            if body.is_empty() {
+                format!(
+                    "        if (el !is JsonObject) {}\n",
+                    ctx.push("path", "must be an object")
+                )
             } else {
-                checks.join("\n") + "\n"
+                format!(
+                    "        run {{\n            if (el !is JsonObject) {{ {}; return@run }}\n            val obj = el.jsonObject\n{}\n        }}\n",
+                    ctx.push("path", "must be an object"),
+                    body.join("\n")
+                )
             }
         }
         SchemaIr::Ref(name) | SchemaIr::Lazy(name) => {
             // Delegate to the referenced type's serializer, which performs the
-            // full validation for that definition (data class, enum or wrapper).
-            let safe = sanitize_kotlin_name(name, prefix);
-            format!("        _lenientJson.decodeFromJsonElement<{safe}>(el)\n")
+            // full validation for that definition (data class, enum or
+            // wrapper). Its collected issues are re-pathed under this
+            // location; non-JST serialization failures (plain data classes,
+            // enums) become a single issue here.
+            let safe = sanitize_kotlin_name(name, ctx.prefix);
+            format!(
+                "        try {{\n            _lenientJson.decodeFromJsonElement<{safe}>(el)\n        }} catch (e: {exc}) {{\n            for (iss in e.issues) issues.add({issue}(path + iss.path, iss.message))\n        }} catch (e: Exception) {{\n            issues.add({issue}(path, e.message ?: \"does not match the referenced schema\"))\n        }}\n",
+                exc = ctx.exc,
+                issue = ctx.issue
+            )
         }
         _ => String::new(),
     }
 }
 
-fn emit_number_checks(checks: &mut Vec<String>, c: &NumberConstraints, var_name: &str, _is_int: bool) {
+/// Bound/multipleOf pushes over an in-scope numeric `v` (12-space indent).
+fn emit_number_pushes(out: &mut String, c: &NumberConstraints, var_name: &str, ctx: &Ctx) {
     if let Some(min) = c.minimum {
-        let b = format_kt_number(min);
-        checks.push(format!("        require({var_name} >= {b}) {{ \"minimum\" }}"));
+        out.push_str(&format!(
+            "            if (!({var_name} >= {})) {}\n",
+            format_kt_number(min),
+            ctx.push("path", &format!("must be >= {}", format_msg_number(min)))
+        ));
     }
     if let Some(max) = c.maximum {
-        let b = format_kt_number(max);
-        checks.push(format!("        require({var_name} <= {b}) {{ \"maximum\" }}"));
+        out.push_str(&format!(
+            "            if (!({var_name} <= {})) {}\n",
+            format_kt_number(max),
+            ctx.push("path", &format!("must be <= {}", format_msg_number(max)))
+        ));
     }
     if let Some(emin) = c.exclusive_minimum {
-        let b = format_kt_number(emin);
-        checks.push(format!("        require({var_name} > {b}) {{ \"exclusiveMinimum\" }}"));
+        out.push_str(&format!(
+            "            if (!({var_name} > {})) {}\n",
+            format_kt_number(emin),
+            ctx.push("path", &format!("must be > {}", format_msg_number(emin)))
+        ));
     }
     if let Some(emax) = c.exclusive_maximum {
-        let b = format_kt_number(emax);
-        checks.push(format!("        require({var_name} < {b}) {{ \"exclusiveMaximum\" }}"));
+        out.push_str(&format!(
+            "            if (!({var_name} < {})) {}\n",
+            format_kt_number(emax),
+            ctx.push("path", &format!("must be < {}", format_msg_number(emax)))
+        ));
     }
     if let Some(mul) = c.multiple_of {
         let b = format_kt_number(mul);
-        checks.push(format!(
-            "        require(({var_name}.toDouble() / {b}).let {{ it.isFinite() && it == kotlin.math.floor(it) }}) {{ \"multipleOf\" }}"
+        out.push_str(&format!(
+            "            if (!(({var_name}.toDouble() / {b}).let {{ it.isFinite() && it == kotlin.math.floor(it) }})) {}\n",
+            ctx.push("path", &format!("must be a multiple of {}", format_msg_number(mul)))
         ));
-    }
-}
-
-fn emit_literal_check(lit: &LiteralValue) -> String {
-    match lit {
-        LiteralValue::Bool(b) => format!(
-            "        require(el is JsonPrimitive && !el.isString && el.booleanOrNull == {}) {{ \"must be {}\" }}\n",
-            b, b
-        ),
-        LiteralValue::Integer(i) => format!(
-            "        require(el is JsonPrimitive && !el.isString && el.booleanOrNull == null && (el.longOrNull == {i}L || el.doubleOrNull == {i}.0)) {{ \"must be {i}\" }}\n"
-        ),
-        LiteralValue::Number(n) => {
-            let b = format_kt_number(*n);
-            format!(
-                "        require(el is JsonPrimitive && !el.isString && el.booleanOrNull == null && el.doubleOrNull == {b}) {{ \"must be {b}\" }}\n"
-            )
-        }
-        LiteralValue::String(s) => {
-            let escaped = escape_string(s);
-            format!(
-                "        require(el is JsonPrimitive && el.isString && el.content == \"{escaped}\") {{ \"must be \\\"{escaped}\\\"\" }}\n"
-            )
-        }
-        LiteralValue::Null => {
-            "        require(el is JsonNull) { \"must be null\" }\n".to_string()
-        }
     }
 }
 
@@ -1109,151 +1197,214 @@ fn emit_literal_match(lit: &LiteralValue) -> String {
     }
 }
 
-fn emit_inline_check(ir: &SchemaIr, var_name: &str, defs: &[DefEntry], prefix: &str) -> String {
+/// Single-statement check for a value expression `var_name` at `path_expr`.
+/// Simple types push directly; complex schemas rebind `el`/`path` in a `run`
+/// scope (Kotlin resolves the initializers against the outer bindings) and
+/// reuse the full statement generator, so nested failures accumulate into the
+/// same `issues` list with composed paths.
+fn emit_inline_check(ir: &SchemaIr, var_name: &str, path_expr: &str, ctx: &Ctx) -> String {
     match ir {
         SchemaIr::Integer(c) if c.minimum.is_none() && c.maximum.is_none() && c.exclusive_minimum.is_none() && c.exclusive_maximum.is_none() && c.multiple_of.is_none() => {
-            format!("require({var_name} is JsonPrimitive && !{var_name}.jsonPrimitive.isString && {var_name}.jsonPrimitive.booleanOrNull == null && ({var_name}.jsonPrimitive.longOrNull != null || {var_name}.jsonPrimitive.doubleOrNull?.let {{ it == it.toLong().toDouble() }} == true))")
+            format!(
+                "if (!({var_name} is JsonPrimitive && !{var_name}.jsonPrimitive.isString && {var_name}.jsonPrimitive.booleanOrNull == null && ({var_name}.jsonPrimitive.longOrNull != null || {var_name}.jsonPrimitive.doubleOrNull?.let {{ it == it.toLong().toDouble() }} == true))) {}",
+                ctx.push(path_expr, "must be an integer")
+            )
         }
         SchemaIr::Number(c) if c.minimum.is_none() && c.maximum.is_none() && c.exclusive_minimum.is_none() && c.exclusive_maximum.is_none() && c.multiple_of.is_none() => {
-            format!("require({var_name} is JsonPrimitive && !{var_name}.jsonPrimitive.isString && {var_name}.jsonPrimitive.booleanOrNull == null && {var_name}.jsonPrimitive.doubleOrNull != null)")
+            format!(
+                "if (!({var_name} is JsonPrimitive && !{var_name}.jsonPrimitive.isString && {var_name}.jsonPrimitive.booleanOrNull == null && {var_name}.jsonPrimitive.doubleOrNull != null)) {}",
+                ctx.push(path_expr, "must be a number")
+            )
         }
-        SchemaIr::Boolean => format!("require({var_name} is JsonPrimitive && !{var_name}.jsonPrimitive.isString && {var_name}.jsonPrimitive.booleanOrNull != null)"),
+        SchemaIr::Boolean => format!(
+            "if (!({var_name} is JsonPrimitive && !{var_name}.jsonPrimitive.isString && {var_name}.jsonPrimitive.booleanOrNull != null)) {}",
+            ctx.push(path_expr, "must be a boolean")
+        ),
         SchemaIr::String(c) if c.min_length.is_none() && c.max_length.is_none() && c.pattern.is_none() => {
-            format!("require({var_name} is JsonPrimitive && {var_name}.jsonPrimitive.isString)")
+            format!(
+                "if (!({var_name} is JsonPrimitive && {var_name}.jsonPrimitive.isString)) {}",
+                ctx.push(path_expr, "must be a string")
+            )
         }
-        SchemaIr::Null => format!("require({var_name} is JsonNull)"),
+        SchemaIr::Null => format!(
+            "if ({var_name} !is JsonNull) {}",
+            ctx.push(path_expr, "must be null")
+        ),
         SchemaIr::Any | SchemaIr::Unknown => String::new(),
-        SchemaIr::Never => format!("error(\"schema rejects all values\")"),
+        SchemaIr::Never => ctx.push(path_expr, "schema rejects all values"),
         _ => {
-            // For complex schemas, use full validation via el rebinding
-            let mut counter = 0usize;
-            let validation = emit_validation(ir, defs, prefix, &mut counter);
+            // For complex schemas, use full validation via el/path rebinding.
+            let validation = emit_validation(ir, ctx);
             if validation.is_empty() {
                 return String::new();
             }
-            format!("run {{ val el = {var_name}; {} }}", validation.trim())
+            format!(
+                "run {{ val el = {var_name}; val path = {path_expr}; {} }}",
+                validation.trim()
+            )
         }
     }
 }
 
-/// Generate a try/catch expression that returns true if `var_name` matches `ir`.
-fn emit_match_expression(ir: &SchemaIr, var_name: &str, defs: &[DefEntry], prefix: &str) -> String {
-    let mut counter = 0usize;
-    let validation = emit_validation(ir, defs, prefix, &mut counter);
+/// Kotlin Boolean expression: does `var_name` match `ir`? Runs the collector
+/// against a throwaway issues list in a private scope and reports emptiness —
+/// used where composition needs only a match verdict (anyOf/oneOf branches,
+/// if/then/else, not, contains counting, propertyNames).
+fn emit_verdict_expr(ir: &SchemaIr, var_name: &str, ctx: &Ctx) -> String {
+    let validation = emit_validation(ir, ctx);
     if validation.is_empty() {
         return "true".to_string();
     }
     format!(
-        "try {{ val el = {var_name}; {}; true }} catch (_: Exception) {{ false }}",
-        validation.trim()
+        "try {{ run {{ val el = {var_name}; val path = \"\"; val issues = mutableListOf<{}>()\n{}\n        issues.isEmpty() }} }} catch (_: Exception) {{ false }}",
+        ctx.issue,
+        validation.trim_end()
     )
 }
 
-fn emit_array_validation(arr: &ArraySchema, defs: &[DefEntry], prefix: &str, _counter: &mut usize) -> String {
-    let mut checks = Vec::new();
-    checks.push("        require(el is JsonArray) { \"must be an array\" }".to_string());
-    checks.push("        val arr = el.jsonArray".to_string());
+fn emit_array_validation(arr: &ArraySchema, ctx: &Ctx) -> String {
+    let mut body: Vec<String> = Vec::new();
 
     if let Some(min) = arr.min_items {
-        checks.push(format!("        require(arr.size >= {min}) {{ \"minItems\" }}"));
+        body.push(format!(
+            "            if (arr.size < {min}) {}",
+            ctx.push("path", &format!("must have at least {min} items"))
+        ));
     }
     if let Some(max) = arr.max_items {
-        checks.push(format!("        require(arr.size <= {max}) {{ \"maxItems\" }}"));
+        body.push(format!(
+            "            if (arr.size > {max}) {}",
+            ctx.push("path", &format!("must have at most {max} items"))
+        ));
     }
 
-    // Item type validation
+    // Item type validation, each index reported independently.
     if !matches!(arr.items.as_ref(), SchemaIr::Any) {
-        let item_check = emit_inline_check(&arr.items, "item", defs, prefix);
+        let item_check = emit_inline_check(&arr.items, "item", "path + \"/\" + i", ctx);
         if !item_check.is_empty() {
-            checks.push(format!("        for (item in arr) {{ {item_check} }}"));
+            body.push(format!(
+                "            for ((i, item) in arr.withIndex()) {{ {item_check} }}"
+            ));
         }
     }
 
     if arr.unique_items {
-        checks.push(
-            "        require(arr.map { _canonicalize(it) }.toSet().size == arr.size) { \"uniqueItems\" }"
-                .to_string(),
-        );
+        // Every duplicate index gets its own issue.
+        body.push("            val _seen = mutableSetOf<String>()".to_string());
+        body.push(format!(
+            "            for ((i, item) in arr.withIndex()) {{ if (!_seen.add(_canonicalize(item))) {} }}",
+            ctx.push("path + \"/\" + i", "duplicate item")
+        ));
     }
 
     if let Some(contains) = &arr.contains {
-        let contains_check = emit_inline_check(&contains.schema, "it", defs, prefix);
-        let min = contains.min_contains.unwrap_or(1);
-        if !contains_check.is_empty() {
-            checks.push(format!(
-                "        val matchCount = arr.count {{ try {{ {contains_check}; true }} catch (_: Exception) {{ false }} }}"
-            ));
-        } else {
-            // contains schema is Any — every item matches
-            checks.push("        val matchCount = arr.size".to_string());
-        }
-        checks.push(format!(
-            "        require(matchCount >= {min}) {{ \"must contain at least {min} matching items\" }}"
-        ));
-        if let Some(max) = contains.max_contains {
-            checks.push(format!(
-                "        require(matchCount <= {max}) {{ \"must contain at most {max} matching items\" }}"
-            ));
-        }
+        push_contains_checks(&mut body, contains, ctx);
     }
 
-    checks.join("\n") + "\n"
+    if body.is_empty() {
+        return format!(
+            "        if (el !is JsonArray) {}\n",
+            ctx.push("path", "must be an array")
+        );
+    }
+    format!(
+        "        run {{\n            if (el !is JsonArray) {{ {}; return@run }}\n            val arr = el.jsonArray\n{}\n        }}\n",
+        ctx.push("path", "must be an array"),
+        body.join("\n")
+    )
 }
 
-fn emit_tuple_validation(tuple: &TupleSchema, defs: &[DefEntry], prefix: &str, _counter: &mut usize) -> String {
-    let mut checks = Vec::new();
-    checks.push("        require(el is JsonArray) { \"must be an array\" }".to_string());
-    checks.push("        val arr = el.jsonArray".to_string());
+/// `contains`/`minContains`/`maxContains` checks over an in-scope `arr`
+/// (verdict-only per item: only match/no-match is meaningful for counting).
+fn push_contains_checks(body: &mut Vec<String>, contains: &ContainsSchema, ctx: &Ctx) {
+    let verdict = emit_verdict_expr(&contains.schema, "it", ctx);
+    let min = contains.min_contains.unwrap_or(1);
+    if verdict == "true" {
+        // contains schema is Any — every item matches
+        body.push("            val matchCount = arr.size".to_string());
+    } else {
+        body.push(format!("            val matchCount = arr.count {{ {verdict} }}"));
+    }
+    body.push(format!(
+        "            if (matchCount < {min}) {}",
+        ctx.push("path", &format!("must contain at least {min} matching items (contains)"))
+    ));
+    if let Some(max) = contains.max_contains {
+        body.push(format!(
+            "            if (matchCount > {max}) {}",
+            ctx.push("path", &format!("must contain at most {max} matching items (contains)"))
+        ));
+    }
+}
+
+fn emit_tuple_validation(tuple: &TupleSchema, ctx: &Ctx) -> String {
+    let mut body: Vec<String> = Vec::new();
 
     // Prefix item type checks
     for (i, item) in tuple.items.iter().enumerate() {
         if matches!(item, SchemaIr::Any) {
             continue;
         }
-        let item_check = emit_inline_check(item, &format!("arr[{i}]"), defs, prefix);
+        let item_check =
+            emit_inline_check(item, &format!("arr[{i}]"), &format!("path + \"/{i}\""), ctx);
         if !item_check.is_empty() {
-            checks.push(format!("        if (arr.size > {i}) {{ {item_check} }}"));
+            body.push(format!("            if (arr.size > {i}) {{ {item_check} }}"));
         }
     }
 
     let prefix_count = tuple.items.len();
     if let Some(rest) = &tuple.rest {
         if !matches!(rest.as_ref(), SchemaIr::Any) {
-            let rest_check = emit_inline_check(rest, "arr[i]", defs, prefix);
+            let rest_check = emit_inline_check(rest, "arr[i]", "path + \"/\" + i", ctx);
             if !rest_check.is_empty() {
-                checks.push(format!("        for (i in {prefix_count} until arr.size) {{ {rest_check} }}"));
+                body.push(format!(
+                    "            for (i in {prefix_count} until arr.size) {{ {rest_check} }}"
+                ));
             }
         }
     } else {
-        checks.push(format!(
-            "        require(arr.size <= {prefix_count}) {{ \"too many items\" }}"
+        body.push(format!(
+            "            if (arr.size > {prefix_count}) {}",
+            ctx.push("path", &format!("must have at most {prefix_count} items"))
         ));
     }
 
     if let Some(min) = tuple.min_items {
-        checks.push(format!("        require(arr.size >= {min}) {{ \"minItems\" }}"));
+        body.push(format!(
+            "            if (arr.size < {min}) {}",
+            ctx.push("path", &format!("must have at least {min} items"))
+        ));
     }
     if let Some(max) = tuple.max_items {
-        checks.push(format!("        require(arr.size <= {max}) {{ \"maxItems\" }}"));
+        body.push(format!(
+            "            if (arr.size > {max}) {}",
+            ctx.push("path", &format!("must have at most {max} items"))
+        ));
     }
 
     if tuple.unique_items {
-        checks.push(
-            "        require(arr.map { _canonicalize(it) }.toSet().size == arr.size) { \"uniqueItems\" }"
-                .to_string(),
-        );
+        body.push("            val _seen = mutableSetOf<String>()".to_string());
+        body.push(format!(
+            "            for ((i, item) in arr.withIndex()) {{ if (!_seen.add(_canonicalize(item))) {} }}",
+            ctx.push("path + \"/\" + i", "duplicate item")
+        ));
     }
 
-    checks.join("\n") + "\n"
+    if body.is_empty() {
+        return format!(
+            "        if (el !is JsonArray) {}\n",
+            ctx.push("path", "must be an array")
+        );
+    }
+    format!(
+        "        run {{\n            if (el !is JsonArray) {{ {}; return@run }}\n            val arr = el.jsonArray\n{}\n        }}\n",
+        ctx.push("path", "must be an array"),
+        body.join("\n")
+    )
 }
 
-fn emit_type_guarded_validation(
-    guards: &[(TypeGuard, Box<SchemaIr>)],
-    defs: &[DefEntry],
-    prefix: &str,
-    _counter: &mut usize,
-) -> String {
-    let mut checks = Vec::new();
+fn emit_type_guarded_validation(guards: &[(TypeGuard, Box<SchemaIr>)], ctx: &Ctx) -> String {
+    let mut checks: Vec<String> = Vec::new();
 
     for (guard, schema) in guards {
         match guard {
@@ -1262,15 +1413,22 @@ fn emit_type_guarded_validation(
                     checks.push("        if (el is JsonPrimitive && el.isString) {".to_string());
                     checks.push("            val v = el.content".to_string());
                     if let Some(min) = c.min_length {
-                        checks.push(format!("            require(v.codePointCount(0, v.length) >= {min}) {{ \"minLength\" }}"));
+                        checks.push(format!(
+                            "            if (!(v.codePointCount(0, v.length) >= {min})) {}",
+                            ctx.push("path", &format!("must be at least {min} characters"))
+                        ));
                     }
                     if let Some(max) = c.max_length {
-                        checks.push(format!("            require(v.codePointCount(0, v.length) <= {max}) {{ \"maxLength\" }}"));
+                        checks.push(format!(
+                            "            if (!(v.codePointCount(0, v.length) <= {max})) {}",
+                            ctx.push("path", &format!("must be at most {max} characters"))
+                        ));
                     }
                     if let Some(ref pat) = c.pattern {
                         checks.push(format!(
-                            "            require(Regex(\"{}\").containsMatchIn(v)) {{ \"pattern\" }}",
-                            escape_string(&translate_pattern(pat))
+                            "            if (!Regex(\"{}\").containsMatchIn(v)) {}",
+                            escape_string(&translate_pattern(pat)),
+                            ctx.push("path", &format!("must match pattern {pat}"))
                         ));
                     }
                     checks.push("        }".to_string());
@@ -1283,27 +1441,10 @@ fn emit_type_guarded_validation(
                 };
                 checks.push("        if (el is JsonPrimitive && !el.isString && el.booleanOrNull == null && el.doubleOrNull != null) {".to_string());
                 checks.push("            val v = el.doubleOrNull!!".to_string());
-                if let Some(min) = c.minimum {
-                    let b = format_kt_number(min);
-                    checks.push(format!("            require(v >= {b}) {{ \"minimum\" }}"));
-                }
-                if let Some(max) = c.maximum {
-                    let b = format_kt_number(max);
-                    checks.push(format!("            require(v <= {b}) {{ \"maximum\" }}"));
-                }
-                if let Some(emin) = c.exclusive_minimum {
-                    let b = format_kt_number(emin);
-                    checks.push(format!("            require(v > {b}) {{ \"exclusiveMinimum\" }}"));
-                }
-                if let Some(emax) = c.exclusive_maximum {
-                    let b = format_kt_number(emax);
-                    checks.push(format!("            require(v < {b}) {{ \"exclusiveMaximum\" }}"));
-                }
-                if let Some(mul) = c.multiple_of {
-                    let b = format_kt_number(mul);
-                    checks.push(format!(
-                        "            require((v / {b}).let {{ it.isFinite() && it == kotlin.math.floor(it) }}) {{ \"multipleOf\" }}"
-                    ));
+                let mut pushes = String::new();
+                emit_number_pushes(&mut pushes, c, "v", ctx);
+                for l in pushes.trim_end().lines() {
+                    checks.push(l.to_string());
                 }
                 checks.push("        }".to_string());
             }
@@ -1311,106 +1452,17 @@ fn emit_type_guarded_validation(
                 if let SchemaIr::Object(obj) = schema.as_ref() {
                     checks.push("        if (el is JsonObject) {".to_string());
                     checks.push("            val obj = el.jsonObject".to_string());
-                    for (k, f) in &obj.fields {
-                        if f.required {
-                            checks.push(format!(
-                                "            require(\"{}\" in obj) {{ \"required: {}\" }}",
-                                escape_string(k), escape_string(k)
-                            ));
-                        }
-                        // Field type validation
-                        let field_check = emit_inline_check(&f.schema, &format!("obj[\"{}\"]!!", escape_string(k)), defs, prefix);
-                        if !field_check.is_empty() && !matches!(&f.schema, SchemaIr::Any | SchemaIr::Unknown) {
-                            checks.push(format!(
-                                "            if (\"{}\" in obj) {{ {} }}",
-                                escape_string(k), field_check
-                            ));
-                        }
-                    }
-                    if let Some(min) = obj.min_properties {
-                        checks.push(format!("            require(obj.size >= {min}) {{ \"minProperties\" }}"));
-                    }
-                    if let Some(max) = obj.max_properties {
-                        checks.push(format!("            require(obj.size <= {max}) {{ \"maxProperties\" }}"));
-                    }
-                    // patternProperties + additionalProperties interaction:
-                    // additionalProperties applies only to keys not matched by
-                    // a named property or any patternProperties regex.
-                    if !obj.pattern_properties.is_empty() {
-                        let known: Vec<String> = obj.fields.keys().map(|k| format!("\"{}\"", escape_string(k))).collect();
-                        checks.push("            for ((k, v) in obj) {".to_string());
-                        checks.push(format!("                var matched = setOf<String>({}).contains(k)", known.join(", ")));
-                        for (pattern, pp_schema) in &obj.pattern_properties {
-                            let pp_check = emit_inline_check(pp_schema, "v", defs, prefix);
-                            if !pp_check.is_empty() {
-                                checks.push(format!(
-                                    "                if (Regex(\"{}\").containsMatchIn(k)) {{ matched = true; {} }}",
-                                    escape_string(&translate_pattern(pattern)), pp_check
-                                ));
-                            } else {
-                                checks.push(format!(
-                                    "                if (Regex(\"{}\").containsMatchIn(k)) {{ matched = true }}",
-                                    escape_string(&translate_pattern(pattern))
-                                ));
-                            }
-                        }
-                        if matches!(obj.additional_properties, AdditionalProperties::Forbidden) {
-                            checks.push("                require(matched) { \"unexpected property: $k\" }".to_string());
-                        } else if let AdditionalProperties::Schema(ap) = &obj.additional_properties {
-                            let ap_check = emit_inline_check(ap, "v", defs, prefix);
-                            if !ap_check.is_empty() {
-                                checks.push(format!("                if (!matched) {{ {} }}", ap_check));
-                            }
-                        }
-                        checks.push("            }".to_string());
-                    } else if matches!(obj.additional_properties, AdditionalProperties::Forbidden) {
-                        let known: Vec<String> = obj.fields.keys().map(|k| format!("\"{}\"", escape_string(k))).collect();
-                        checks.push(format!(
-                            "            val known = setOf<String>({})",
-                            known.join(", ")
-                        ));
-                        checks.push("            for (k in obj.keys) { require(k in known) { \"unexpected property: $k\" } }".to_string());
-                    } else if let AdditionalProperties::Schema(ap) = &obj.additional_properties {
-                        let known: Vec<String> = obj.fields.keys().map(|k| format!("\"{}\"", escape_string(k))).collect();
-                        let ap_check = emit_inline_check(ap, "v", defs, prefix);
-                        if !ap_check.is_empty() {
-                            checks.push(format!(
-                                "            val _known = setOf<String>({})\n            for ((k, v) in obj) {{ if (k !in _known) {{ {} }} }}",
-                                known.join(", "), ap_check
-                            ));
-                        }
-                    }
-                    // propertyNames
-                    if let Some(pn) = &obj.property_names {
-                        emit_property_names_checks(pn, &mut checks, "            ", defs, prefix);
-                    }
-                    // dependentRequired
-                    for (prop, required) in &obj.dependent_required {
-                        for r in required {
-                            checks.push(format!(
-                                "            if (\"{}\" in obj) require(\"{}\" in obj) {{ \"dependentRequired\" }}",
-                                escape_string(prop), escape_string(r)
-                            ));
-                        }
-                    }
-                    // dependentSchemas
-                    for (prop, dep_schema) in &obj.dependent_schemas {
-                        let dep_check = emit_match_expression(dep_schema, "el", defs, prefix);
-                        if dep_check != "true" {
-                            checks.push(format!(
-                                "            if (\"{}\" in obj) {{ require({}) {{ \"dependentSchemas\" }} }}",
-                                escape_string(prop), dep_check
-                            ));
-                        }
-                    }
+                    checks.extend(emit_object_checks(obj, ctx, "            "));
                     checks.push("        }".to_string());
                 }
                 // Record in TypeGuard::Object
                 if let SchemaIr::Record(rec) = schema.as_ref() {
-                    let val_check = emit_inline_check(&rec.value, "v", defs, prefix);
+                    let val_check = emit_inline_check(&rec.value, "v", DYN_KEY_PATH, ctx);
                     if !val_check.is_empty() {
                         checks.push("        if (el is JsonObject) {".to_string());
-                        checks.push(format!("            for ((_, v) in el.jsonObject) {{ {} }}", val_check));
+                        checks.push(format!(
+                            "            for ((k, v) in el.jsonObject) {{ {val_check} }}"
+                        ));
                         checks.push("        }".to_string());
                     }
                 }
@@ -1420,38 +1472,38 @@ fn emit_type_guarded_validation(
                     checks.push("        if (el is JsonArray) {".to_string());
                     checks.push("            val arr = el.jsonArray".to_string());
                     if let Some(min) = arr.min_items {
-                        checks.push(format!("            require(arr.size >= {min}) {{ \"minItems\" }}"));
+                        checks.push(format!(
+                            "            if (arr.size < {min}) {}",
+                            ctx.push("path", &format!("must have at least {min} items"))
+                        ));
                     }
                     if let Some(max) = arr.max_items {
-                        checks.push(format!("            require(arr.size <= {max}) {{ \"maxItems\" }}"));
+                        checks.push(format!(
+                            "            if (arr.size > {max}) {}",
+                            ctx.push("path", &format!("must have at most {max} items"))
+                        ));
                     }
                     if !matches!(arr.items.as_ref(), SchemaIr::Any) {
-                        let item_check = emit_inline_check(&arr.items, "item", defs, prefix);
+                        let item_check =
+                            emit_inline_check(&arr.items, "item", "path + \"/\" + i", ctx);
                         if !item_check.is_empty() {
-                            checks.push(format!("            for (item in arr) {{ {item_check} }}"));
+                            checks.push(format!(
+                                "            for ((i, item) in arr.withIndex()) {{ {item_check} }}"
+                            ));
                         }
                     }
                     if arr.unique_items {
-                        checks.push(
-                            "            require(arr.map { _canonicalize(it) }.toSet().size == arr.size) { \"uniqueItems\" }"
-                                .to_string(),
-                        );
+                        checks.push("            val _seen = mutableSetOf<String>()".to_string());
+                        checks.push(format!(
+                            "            for ((i, item) in arr.withIndex()) {{ if (!_seen.add(_canonicalize(item))) {} }}",
+                            ctx.push("path + \"/\" + i", "duplicate item")
+                        ));
                     }
                     // contains in TypeGuard::Array
                     if let Some(contains) = &arr.contains {
-                        let match_expr = emit_match_expression(&contains.schema, "it", defs, prefix);
-                        let min = contains.min_contains.unwrap_or(1);
-                        checks.push(format!(
-                            "            val matchCount = arr.count {{ {match_expr} }}"
-                        ));
-                        checks.push(format!(
-                            "            require(matchCount >= {min}) {{ \"must contain at least {min} matching items\" }}"
-                        ));
-                        if let Some(max) = contains.max_contains {
-                            checks.push(format!(
-                                "            require(matchCount <= {max}) {{ \"must contain at most {max} matching items\" }}"
-                            ));
-                        }
+                        let mut contains_body: Vec<String> = Vec::new();
+                        push_contains_checks(&mut contains_body, contains, ctx);
+                        checks.extend(contains_body);
                     }
                     checks.push("        }".to_string());
                 }
@@ -1460,36 +1512,56 @@ fn emit_type_guarded_validation(
                     checks.push("        if (el is JsonArray) {".to_string());
                     checks.push("            val arr = el.jsonArray".to_string());
                     for (i, item) in tuple.items.iter().enumerate() {
-                        if matches!(item, SchemaIr::Any) { continue; }
-                        let item_check = emit_inline_check(item, &format!("arr[{i}]"), defs, prefix);
+                        if matches!(item, SchemaIr::Any) {
+                            continue;
+                        }
+                        let item_check = emit_inline_check(
+                            item,
+                            &format!("arr[{i}]"),
+                            &format!("path + \"/{i}\""),
+                            ctx,
+                        );
                         if !item_check.is_empty() {
-                            checks.push(format!("            if (arr.size > {i}) {{ {item_check} }}"));
+                            checks.push(format!(
+                                "            if (arr.size > {i}) {{ {item_check} }}"
+                            ));
                         }
                     }
                     let prefix_count = tuple.items.len();
                     if let Some(rest) = &tuple.rest {
                         if !matches!(rest.as_ref(), SchemaIr::Any) {
-                            let rest_check = emit_inline_check(rest, "arr[i]", defs, prefix);
+                            let rest_check =
+                                emit_inline_check(rest, "arr[i]", "path + \"/\" + i", ctx);
                             if !rest_check.is_empty() {
-                                checks.push(format!("            for (i in {prefix_count} until arr.size) {{ {rest_check} }}"));
+                                checks.push(format!(
+                                    "            for (i in {prefix_count} until arr.size) {{ {rest_check} }}"
+                                ));
                             }
                         }
                     } else {
                         checks.push(format!(
-                            "            require(arr.size <= {prefix_count}) {{ \"too many items\" }}"
+                            "            if (arr.size > {prefix_count}) {}",
+                            ctx.push("path", &format!("must have at most {prefix_count} items"))
                         ));
                     }
                     if let Some(min) = tuple.min_items {
-                        checks.push(format!("            require(arr.size >= {min}) {{ \"minItems\" }}"));
+                        checks.push(format!(
+                            "            if (arr.size < {min}) {}",
+                            ctx.push("path", &format!("must have at least {min} items"))
+                        ));
                     }
                     if let Some(max) = tuple.max_items {
-                        checks.push(format!("            require(arr.size <= {max}) {{ \"maxItems\" }}"));
+                        checks.push(format!(
+                            "            if (arr.size > {max}) {}",
+                            ctx.push("path", &format!("must have at most {max} items"))
+                        ));
                     }
                     if tuple.unique_items {
-                        checks.push(
-                            "            require(arr.map { _canonicalize(it) }.toSet().size == arr.size) { \"uniqueItems\" }"
-                                .to_string(),
-                        );
+                        checks.push("            val _seen = mutableSetOf<String>()".to_string());
+                        checks.push(format!(
+                            "            for ((i, item) in arr.withIndex()) {{ if (!_seen.add(_canonicalize(item))) {} }}",
+                            ctx.push("path + \"/\" + i", "duplicate item")
+                        ));
                     }
                     checks.push("        }".to_string());
                 }
@@ -1504,25 +1576,155 @@ fn emit_type_guarded_validation(
     }
 }
 
-fn emit_property_names_checks(pn: &SchemaIr, checks: &mut Vec<String>, indent: &str, defs: &[DefEntry], prefix: &str) {
-    let m = emit_match_expression(pn, "JsonPrimitive(k)", defs, prefix);
-    if m == "true" {
-        return;
+/// Object constraint checks over in-scope `obj` (a JsonObject map), `el`,
+/// `path` and `issues`. `ind` is the statement indent; used both by the
+/// Object arm (inside its `run {}` guard) and TypeGuard::Object (inside its
+/// `if (el is JsonObject)` block).
+fn emit_object_checks(obj: &ObjectSchema, ctx: &Ctx, ind: &str) -> Vec<String> {
+    let mut checks: Vec<String> = Vec::new();
+
+    for (k, f) in &obj.fields {
+        let ek = escape_string(k);
+        if f.required {
+            // Every missing required key reports its own issue.
+            checks.push(format!(
+                "{ind}if (\"{ek}\" !in obj) {}",
+                ctx.push(&child_path(k), "required property is missing")
+            ));
+        }
+        if !matches!(&f.schema, SchemaIr::Any | SchemaIr::Unknown) {
+            let field_check =
+                emit_inline_check(&f.schema, &format!("obj[\"{ek}\"]!!"), &child_path(k), ctx);
+            if !field_check.is_empty() {
+                checks.push(format!("{ind}if (\"{ek}\" in obj) {{ {field_check} }}"));
+            }
+        }
     }
-    checks.push(format!(
-        "{indent}for (k in obj.keys) {{ require({m}) {{ \"propertyNames\" }} }}"
-    ));
+    if let Some(min) = obj.min_properties {
+        checks.push(format!(
+            "{ind}if (obj.size < {min}) {}",
+            ctx.push("path", &format!("must have at least {min} properties"))
+        ));
+    }
+    if let Some(max) = obj.max_properties {
+        checks.push(format!(
+            "{ind}if (obj.size > {max}) {}",
+            ctx.push("path", &format!("must have at most {max} properties"))
+        ));
+    }
+    // patternProperties + additionalProperties interaction:
+    // additionalProperties applies only to keys not matched by a named
+    // property or any patternProperties regex.
+    let known: Vec<String> = obj
+        .fields
+        .keys()
+        .map(|k| format!("\"{}\"", escape_string(k)))
+        .collect();
+    if !obj.pattern_properties.is_empty() {
+        checks.push(format!("{ind}for ((k, v) in obj) {{"));
+        checks.push(format!(
+            "{ind}    var matched = setOf<String>({}).contains(k)",
+            known.join(", ")
+        ));
+        for (pattern, pp_schema) in &obj.pattern_properties {
+            let pp_check = emit_inline_check(pp_schema, "v", DYN_KEY_PATH, ctx);
+            if !pp_check.is_empty() {
+                checks.push(format!(
+                    "{ind}    if (Regex(\"{}\").containsMatchIn(k)) {{ matched = true; {} }}",
+                    escape_string(&translate_pattern(pattern)),
+                    pp_check
+                ));
+            } else {
+                checks.push(format!(
+                    "{ind}    if (Regex(\"{}\").containsMatchIn(k)) {{ matched = true }}",
+                    escape_string(&translate_pattern(pattern))
+                ));
+            }
+        }
+        if matches!(obj.additional_properties, AdditionalProperties::Forbidden) {
+            checks.push(format!(
+                "{ind}    if (!matched) {}",
+                ctx.push(DYN_KEY_PATH, "unexpected property")
+            ));
+        } else if let AdditionalProperties::Schema(ap) = &obj.additional_properties {
+            let ap_check = emit_inline_check(ap, "v", DYN_KEY_PATH, ctx);
+            if !ap_check.is_empty() {
+                checks.push(format!("{ind}    if (!matched) {{ {ap_check} }}"));
+            }
+        }
+        checks.push(format!("{ind}}}"));
+    } else if matches!(obj.additional_properties, AdditionalProperties::Forbidden) {
+        checks.push(format!(
+            "{ind}val known = setOf<String>({})",
+            known.join(", ")
+        ));
+        checks.push(format!(
+            "{ind}for (k in obj.keys) {{ if (k !in known) {} }}",
+            ctx.push(DYN_KEY_PATH, "unexpected property")
+        ));
+    } else if let AdditionalProperties::Schema(ap) = &obj.additional_properties {
+        let ap_check = emit_inline_check(ap, "v", DYN_KEY_PATH, ctx);
+        if !ap_check.is_empty() {
+            checks.push(format!(
+                "{ind}val _known = setOf<String>({})",
+                known.join(", ")
+            ));
+            checks.push(format!(
+                "{ind}for ((k, v) in obj) {{ if (k !in _known) {{ {ap_check} }} }}"
+            ));
+        }
+    }
+    // propertyNames (verdict-only per key: the key either matches or not)
+    if let Some(pn) = &obj.property_names {
+        let m = emit_verdict_expr(pn, "JsonPrimitive(k)", ctx);
+        if m != "true" {
+            checks.push(format!(
+                "{ind}for (k in obj.keys) {{ if (!({m})) {} }}",
+                ctx.push(DYN_KEY_PATH, "invalid property name")
+            ));
+        }
+    }
+    // dependentRequired
+    for (prop, required) in &obj.dependent_required {
+        for r in required {
+            checks.push(format!(
+                "{ind}if (\"{}\" in obj && \"{}\" !in obj) {}",
+                escape_string(prop),
+                escape_string(r),
+                ctx.push(&child_path(r), &format!("required when \"{prop}\" is present"))
+            ));
+        }
+    }
+    // dependentSchemas — collected against the whole object, so nested
+    // failures keep their own paths.
+    for (prop, dep_schema) in &obj.dependent_schemas {
+        let dep = emit_validation(dep_schema, ctx);
+        if !dep.is_empty() {
+            checks.push(format!("{ind}if (\"{}\" in obj) {{", escape_string(prop)));
+            // Fragments are generated at 8-space depth; shift to sit inside
+            // this block.
+            let extra = " ".repeat(ind.len().saturating_sub(8) + 4);
+            for l in dep.trim_end().lines() {
+                checks.push(format!("{extra}{l}"));
+            }
+            checks.push(format!("{ind}}}"));
+        }
+    }
+    checks
 }
 
-fn emit_not_check(not_schema: &SchemaIr, defs: &[DefEntry], prefix: &str, counter: &mut usize) -> String {
-    let inner_validation = emit_validation(not_schema, defs, prefix, counter);
-    if inner_validation.is_empty() {
+fn emit_not_check(not_schema: &SchemaIr, ctx: &Ctx) -> String {
+    let verdict = emit_verdict_expr(not_schema, "el", ctx);
+    if verdict == "true" {
         // not_schema accepts everything → nothing can pass
-        return "        error(\"must not match excluded schema\")\n".to_string();
+        return format!(
+            "        {}\n",
+            ctx.push("path", "must not match the excluded schema")
+        );
     }
     format!(
-        "        val notMatched = try {{ {}; true }} catch (_: Exception) {{ false }}\n        require(!notMatched) {{ \"must not match excluded schema\" }}\n",
-        inner_validation.trim()
+        "        if ({verdict}) {}\n",
+        ctx.push("path", "must not match the excluded schema")
     )
 }
 
@@ -1530,71 +1732,68 @@ fn emit_conditional_check(
     if_schema: &SchemaIr,
     then_schema: Option<&SchemaIr>,
     else_schema: Option<&SchemaIr>,
-    defs: &[DefEntry],
-    prefix: &str,
-    counter: &mut usize,
+    ctx: &Ctx,
 ) -> String {
-    let if_validation = emit_validation(if_schema, defs, prefix, counter);
+    let then_c = then_schema
+        .map(|t| emit_validation(t, ctx))
+        .unwrap_or_default();
+    let else_c = else_schema
+        .map(|e| emit_validation(e, ctx))
+        .unwrap_or_default();
+    if then_c.is_empty() && else_c.is_empty() {
+        return String::new();
+    }
+    let if_v = emit_verdict_expr(if_schema, "el", ctx);
     let mut out = String::new();
-
-    out.push_str(&format!(
-        "        val ifMatched = try {{ {}; true }} catch (_: Exception) {{ false }}\n",
-        if_validation.trim()
-    ));
-
-    if let Some(then_s) = then_schema {
-        let then_validation = emit_validation(then_s, defs, prefix, counter);
-        if !then_validation.is_empty() {
-            out.push_str(&format!(
-                "        if (ifMatched) {{ {} }}\n",
-                then_validation.trim()
-            ));
+    out.push_str("        run {\n");
+    out.push_str(&format!("            val ifMatched = {if_v}\n"));
+    if !then_c.is_empty() {
+        out.push_str("            if (ifMatched) {\n");
+        for l in then_c.trim_end().lines() {
+            out.push_str(&format!("        {l}\n"));
         }
+        out.push_str("            }\n");
     }
-    if let Some(else_s) = else_schema {
-        let else_validation = emit_validation(else_s, defs, prefix, counter);
-        if !else_validation.is_empty() {
-            out.push_str(&format!(
-                "        if (!ifMatched) {{ {} }}\n",
-                else_validation.trim()
-            ));
+    if !else_c.is_empty() {
+        out.push_str("            if (!ifMatched) {\n");
+        for l in else_c.trim_end().lines() {
+            out.push_str(&format!("        {l}\n"));
         }
+        out.push_str("            }\n");
     }
-
+    out.push_str("        }\n");
     out
 }
 
-fn emit_union_check(members: &[SchemaIr], defs: &[DefEntry], prefix: &str, counter: &mut usize, exclusive: bool) -> String {
-    let mut branch_checks = Vec::new();
-    for member in members {
-        let validation = emit_validation(member, defs, prefix, counter);
-        if validation.is_empty() {
-            branch_checks.push("true".to_string());
-        } else {
-            branch_checks.push(format!(
-                "try {{ {}; true }} catch (_: Exception) {{ false }}",
-                validation.trim()
-            ));
-        }
-    }
+fn emit_union_check(members: &[SchemaIr], ctx: &Ctx, exclusive: bool) -> String {
+    // anyOf/oneOf verdicts stay single issues: per-branch failure details are
+    // not meaningful when only one branch needs to match.
+    let branch_checks: Vec<String> = members
+        .iter()
+        .map(|m| emit_verdict_expr(m, "el", ctx))
+        .collect();
 
     let mut out = String::new();
-    out.push_str("        val branchResults = listOf(\n");
+    out.push_str("        run {\n");
+    out.push_str("            val branchResults = listOf(\n");
     for (i, check) in branch_checks.iter().enumerate() {
         let comma = if i < branch_checks.len() - 1 { "," } else { "" };
-        out.push_str(&format!("            {check}{comma}\n"));
+        out.push_str(&format!("                {check}{comma}\n"));
     }
-    out.push_str("        )\n");
-    out.push_str("        val matchCount = branchResults.count { it }\n");
+    out.push_str("            )\n");
+    out.push_str("            val matchCount = branchResults.count { it }\n");
     if exclusive {
-        out.push_str(
-            "        require(matchCount == 1) { \"must match exactly one schema, matched $matchCount\" }\n",
-        );
+        out.push_str(&format!(
+            "            if (matchCount != 1) {}\n",
+            ctx.push("path", "must match exactly one of the expected schemas (oneOf)")
+        ));
     } else {
-        out.push_str(
-            "        require(matchCount >= 1) { \"must match at least one schema\" }\n",
-        );
+        out.push_str(&format!(
+            "            if (matchCount < 1) {}\n",
+            ctx.push("path", "must match at least one of the expected schemas (anyOf)")
+        ));
     }
+    out.push_str("        }\n");
     out
 }
 
@@ -1602,9 +1801,11 @@ fn emit_never_class(name: &str, counter: &mut usize, gopts: &GenOptions) -> Stri
     *counter += 1;
     let ser_name = format!("{name}Ser");
     format!(
-        "private object {ser_name} : KSerializer<{name}> {{\n    override val descriptor: SerialDescriptor = JsonElement.serializer().descriptor\n    override fun deserialize(decoder: Decoder): {name} {{ decoder.decodeSerializableValue(JsonElement.serializer()); error(\"schema rejects all values\") }}\n    override fun serialize(encoder: Encoder, value: {name}) {{ encoder.encodeSerializableValue(JsonElement.serializer(), value.element) }}\n}}\n\n@Serializable(with = {ser_name}::class)\nclass {name}({vkw} element: JsonElement) : {iface} {{\n{members}}}",
+        "private object {ser_name} : KSerializer<{name}> {{\n    override val descriptor: SerialDescriptor = JsonElement.serializer().descriptor\n    override fun deserialize(decoder: Decoder): {name} {{ decoder.decodeSerializableValue(JsonElement.serializer()); throw {exc}(listOf({issue}(\"\", \"schema rejects all values\"))) }}\n    override fun serialize(encoder: Encoder, value: {name}) {{ encoder.encodeSerializableValue(JsonElement.serializer(), value.element) }}\n}}\n\n@Serializable(with = {ser_name}::class)\nclass {name}({vkw} element: JsonElement) : {iface} {{\n{members}}}",
         vkw = gopts.val_kw(),
         iface = gopts.iface,
+        exc = gopts.exc,
+        issue = gopts.issue,
         members = validate_members(name)
     )
 }
@@ -1667,6 +1868,17 @@ fn kotlin_type(ir: &SchemaIr, defs: &[DefEntry], prefix: &str) -> String {
 fn format_kt_number(n: f64) -> String {
     if n == n.trunc() && n.abs() < 1e15 {
         format!("{}.0", n as i64)
+    } else {
+        format!("{n}")
+    }
+}
+
+/// Human-friendly number rendering for diagnostic messages: integral values
+/// print without the trailing ".0" (check expressions still use
+/// `format_kt_number`, which must produce a valid Kotlin Double literal).
+fn format_msg_number(n: f64) -> String {
+    if n.fract() == 0.0 && n.abs() < 9.007199254740992e15 {
+        format!("{}", n as i64)
     } else {
         format!("{n}")
     }
@@ -1803,5 +2015,72 @@ mod tests {
         assert!(out.contains("enum class Sample"), "{out}");
         assert!(!out.contains("JstValidatable"), "{out}");
         assert!(!out.contains("import kotlinx.serialization.encodeToString"), "{out}");
+        // No wrapper serializer → no error classes either.
+        assert!(!out.contains("JstIssue"), "{out}");
+    }
+
+    #[test]
+    fn wrapper_collects_all_issues_with_mangled_inline_names() {
+        let out = emit_opts(&order_item_schema(), &EmitOptions::default());
+        // Inline mode: issue/exception classes are declared per file under
+        // mangled names and the serializer collects instead of throwing.
+        assert!(out.contains("data class _SampleJstIssue(val path: String, val message: String)"), "{out}");
+        assert!(out.contains("class _SampleJstValidationException(val issues: List<_SampleJstIssue>)"), "{out}");
+        assert!(out.contains("val issues = mutableListOf<_SampleJstIssue>()"), "{out}");
+        assert!(out.contains("if (issues.isNotEmpty()) throw _SampleJstValidationException(issues)"), "{out}");
+        // Multiple independent constraint pushes, each with a pointer path.
+        assert!(out.contains("issues.add(_SampleJstIssue(path + \"/id\", \"required property is missing\"))"), "{out}");
+        assert!(out.contains("issues.add(_SampleJstIssue(path + \"/quantity\", \"required property is missing\"))"), "{out}");
+        assert!(out.contains("\"must be >= 1\""), "{out}");
+        assert!(out.contains("issues.add(_SampleJstIssue(path + \"/\" + _jstPtr(k), \"unexpected property\"))"), "{out}");
+        // No first-failure aborts left in the wrapper serializer.
+        assert!(!out.contains("require("), "{out}");
+    }
+
+    #[test]
+    fn shared_mode_uses_canonical_error_names_and_tailors_helper() {
+        let converted = Converter::convert(&order_item_schema()).unwrap();
+        let options = EmitOptions {
+            helpers: Some(SharedHelpers::new("JstHelpers.kt")),
+            mutable: false,
+        };
+        let (out, needs) = KotlinEmitter.emit_collecting(&converted, "sample", &options);
+        assert!(needs.contains("error"), "{needs:?}");
+        assert!(out.contains("import jst.helpers.JstIssue"), "{out}");
+        assert!(out.contains("import jst.helpers.JstValidationException"), "{out}");
+        assert!(out.contains("import jst.helpers._jstPtr"), "{out}");
+        assert!(out.contains("val issues = mutableListOf<JstIssue>()"), "{out}");
+        assert!(!out.contains("_SampleJstIssue"), "{out}");
+
+        let helpers = KotlinEmitter.helpers_content_for(&needs).unwrap();
+        // Classes stay public (user code catches the exception type);
+        // only the pointer-escape helper is internalized.
+        assert!(helpers.contains("data class JstIssue"), "{helpers}");
+        assert!(helpers.contains("class JstValidationException"), "{helpers}");
+        assert!(helpers.contains("kotlinx.serialization.SerializationException"), "{helpers}");
+        assert!(helpers.contains("internal fun _jstPtr"), "{helpers}");
+        assert!(!helpers.contains("internal data class JstIssue"), "{helpers}");
+    }
+
+    #[test]
+    fn unique_items_reports_every_duplicate_index() {
+        let out = emit_opts(
+            &json!({"type": "array", "items": {"type": "string"}, "uniqueItems": true}),
+            &EmitOptions::default(),
+        );
+        assert!(out.contains("for ((i, item) in arr.withIndex()) { if (!_seen.add(_canonicalize(item)))"), "{out}");
+        assert!(out.contains("issues.add(_SampleJstIssue(path + \"/\" + i, \"duplicate item\"))"), "{out}");
+    }
+
+    #[test]
+    fn union_verdicts_stay_single_issue() {
+        let out = emit_opts(
+            &json!({"oneOf": [{"type": "string"}, {"type": "integer"}]}),
+            &EmitOptions::default(),
+        );
+        assert!(out.contains("val branchResults = listOf("), "{out}");
+        assert!(out.contains("must match exactly one of the expected schemas (oneOf)"), "{out}");
+        // Branch verdicts run the collector privately and only report a bool.
+        assert!(out.contains("issues.isEmpty() } } catch (_: Exception) { false }"), "{out}");
     }
 }
