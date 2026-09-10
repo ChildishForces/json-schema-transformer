@@ -1,5 +1,5 @@
 import { beforeAll, describe, expect, test } from 'bun:test';
-import { existsSync, mkdirSync, rmSync, writeFileSync } from 'fs';
+import { existsSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'fs';
 import { join } from 'path';
 
 // Integration test: jst CLI → generated Zod module → runtime validation.
@@ -36,6 +36,12 @@ async function runJst(args: string[]): Promise<void> {
   if (result.exitCode !== 0) {
     throw new Error(`jst ${args.join(' ')} failed: ${result.stderr.toString()}`);
   }
+}
+
+async function runJstExpectingError(args: string[]): Promise<string> {
+  const result = await $`${JST} ${args}`.cwd(TMP).quiet().nothrow();
+  expect(result.exitCode).not.toBe(0);
+  return result.stderr.toString();
 }
 
 beforeAll(async () => {
@@ -102,6 +108,89 @@ describe('zod integration', () => {
     for (const [payload, expected] of CASES) {
       expect(schema!.safeParse(payload).success).toBe(expected);
     }
+  });
+
+  test('output collisions are caught pre-write, including the helpers file', async () => {
+    mkdirSync(join(TMP, 'clash'), { recursive: true });
+    writeFileSync(join(TMP, 'clash/a.json'), JSON.stringify({ title: 'FooBar', type: 'object' }));
+    writeFileSync(join(TMP, 'clash/b.json'), JSON.stringify({ title: 'Foobar', type: 'object' }));
+    // Stems differing only by case collide on case-insensitive filesystems.
+    const caseErr = await runJstExpectingError(['clash', '--target', 'zod', '-d', 'clash-out']);
+    expect(caseErr).toContain('output collision');
+    expect(existsSync(join(TMP, 'clash-out'))).toBe(false); // pre-flight: nothing written
+
+    // A schema whose stem matches the shared helpers file name must not clobber it.
+    writeFileSync(
+      join(TMP, 'helpers-clash.json'),
+      JSON.stringify({
+        title: 'Jst Helpers',
+        type: 'array',
+        items: { type: 'integer' },
+        uniqueItems: true,
+      })
+    );
+    const helpersErr = await runJstExpectingError([
+      'helpers-clash.json',
+      '--target',
+      'pydantic',
+      '-d',
+      'hc-out',
+    ]);
+    expect(helpersErr).toContain('shared helpers file');
+  });
+
+  test('symlinked directories are not followed', async () => {
+    mkdirSync(join(TMP, 'loop/sub'), { recursive: true });
+    writeFileSync(join(TMP, 'loop/sub/one.json'), JSON.stringify(SCHEMA));
+    symlinkSync(join(TMP, 'loop'), join(TMP, 'loop/sub/back'));
+    await runJst(['loop', '--target', 'zod', '-d', 'loop-out']);
+    expect(existsSync(join(TMP, 'loop-out/sub/OrderItem.zod.ts'))).toBe(true);
+    expect(existsSync(join(TMP, 'loop-out/sub/back'))).toBe(false);
+  });
+
+  test('--helpers-file names are validated per target', async () => {
+    const extErr = await runJstExpectingError([
+      'sample.json',
+      '--target',
+      'zod',
+      '-d',
+      'hf-out',
+      '--helpers-file',
+      'utils',
+    ]);
+    expect(extErr).toContain('must end with .ts');
+    const identErr = await runJstExpectingError([
+      'sample.json',
+      '--target',
+      'pydantic',
+      '-d',
+      'hf-out',
+      '--helpers-file',
+      'my-helpers.py',
+    ]);
+    expect(identErr).toContain('not importable');
+  });
+
+  test('--name applies to a single-schema directory input', async () => {
+    mkdirSync(join(TMP, 'onedir'), { recursive: true });
+    writeFileSync(join(TMP, 'onedir/thing.json'), JSON.stringify(SCHEMA));
+    await runJst(['onedir', '--target', 'zod', '-d', 'onedir-out', '--name', 'Override']);
+    expect(existsSync(join(TMP, 'onedir-out/Override.zod.ts'))).toBe(true);
+    // and errors with multiple schemas
+    writeFileSync(
+      join(TMP, 'onedir/thing2.json'),
+      JSON.stringify({ title: 'Two', type: 'object' })
+    );
+    const err = await runJstExpectingError([
+      'onedir',
+      '--target',
+      'zod',
+      '-d',
+      'onedir-out',
+      '--name',
+      'Override',
+    ]);
+    expect(err).toContain('ambiguous');
   });
 
   test('name falls back to file stem when no title', async () => {

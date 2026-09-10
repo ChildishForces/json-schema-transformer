@@ -65,8 +65,10 @@ for (const g of manifest.groups) {
   } else {
     const modName = base.replace(/\.rs$/, '');
     mods.push(`mod ${modName};`);
+    // The map key is a string literal (escape it); the type path must be a
+    // valid identifier by construction, used verbatim.
     registrations.push(
-      `    m.insert("${typeName}", (|s| serde_json::from_str::<crate::${modName}::${typeName}>(s).map(|_| ()).map_err(|e| e.to_string())) as Decoder);`
+      `    m.insert("${rustEscape(typeName)}", (|s| serde_json::from_str::<crate::${modName}::${typeName}>(s).map(|_| ()).map_err(|e| e.to_string())) as Decoder);`
     );
   }
 }

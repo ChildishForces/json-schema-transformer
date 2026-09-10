@@ -10,14 +10,6 @@ pub fn _jst_is_integer(v: &serde_json::Value) -> bool {
     }
 }
 
-/// Number -> f64 (lossy for large integers), None for non-numbers.
-pub fn _jst_as_f64(v: &serde_json::Value) -> Option<f64> {
-    match v {
-        serde_json::Value::Number(n) => n.as_f64(),
-        _ => None,
-    }
-}
-
 /// multipleOf check mirroring the float semantics used by the other emitters:
 /// `(v / m)` must be finite and equal to its floor. Exact integer arithmetic is
 /// used when both the value and divisor are integral and in range, so huge

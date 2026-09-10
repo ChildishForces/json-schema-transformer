@@ -84,6 +84,16 @@ impl<'e> CollectionSession<'e> {
         code
     }
 
+    /// The shared helpers file name this session will use, or None for
+    /// languages that emit no runtime helpers.
+    pub fn helpers_file_name(&self) -> Option<&str> {
+        if self.helpers_file.is_empty() {
+            None
+        } else {
+            Some(&self.helpers_file)
+        }
+    }
+
     /// Union of helper components needed by all members emitted so far.
     pub fn helper_needs(&self) -> &HelperSet {
         &self.needs

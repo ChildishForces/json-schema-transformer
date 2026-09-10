@@ -725,6 +725,18 @@ fn emit_companion_invoke(name: &str, obj: &ObjectSchema, defs: &[DefEntry], pref
         }
     }
 
+    // A single required parameter typed JsonElement gives the invoke the same
+    // JVM signature as the primary `(JsonElement)` constructor; overload
+    // resolution always picks the constructor, so the companion would be
+    // unreachable dead code — skip it (callers construct via the raw element).
+    if obj.fields.len() == 1 {
+        if let Some((_, f)) = obj.fields.iter().next() {
+            if f.required && kotlin_type(&f.schema, defs, prefix) == "JsonElement" {
+                return String::new();
+            }
+        }
+    }
+
     format!(
         "    companion object {{\n        operator fun invoke(\n{params},\n        ): {name} = {name}(kotlinx.serialization.json.buildJsonObject {{\n{puts}\n        }})\n    }}\n",
         params = params.join(",\n"),

@@ -23,6 +23,32 @@ pub struct Converter {
     id_registry: HashMap<String, Value>,
     /// Current base URI for resolving relative $ref values
     base_uri: Option<String>,
+    /// Raw def name → assigned PascalCase type name. Distinct raw names can
+    /// collapse to the same PascalCase (e.g. "a-b" and "a_b" → "AB"), which
+    /// would make emitters declare the same type twice and cross-wire refs;
+    /// later arrivals get a numeric suffix. Memoized so every Ref/Lazy/def
+    /// site agrees.
+    pascal_by_raw: HashMap<String, String>,
+    pascals_used: HashSet<String>,
+}
+
+impl Converter {
+    /// The unique PascalCase type name for a raw def name (first come keeps
+    /// the plain PascalCase; collisions get "2", "3", ... appended).
+    fn def_pascal(&mut self, raw: &str) -> String {
+        if let Some(p) = self.pascal_by_raw.get(raw) {
+            return p.clone();
+        }
+        let base = crate::util::to_pascal_case(raw);
+        let mut candidate = base.clone();
+        let mut n = 2usize;
+        while !self.pascals_used.insert(candidate.clone()) {
+            candidate = format!("{base}{n}");
+            n += 1;
+        }
+        self.pascal_by_raw.insert(raw.to_string(), candidate.clone());
+        candidate
+    }
 }
 
 /// Keywords whose semantics depend on evaluation tracking or reference resolution
@@ -202,6 +228,8 @@ impl Converter {
             root_schema: root.clone(),
             id_registry: HashMap::new(),
             base_uri: root_id.clone(),
+            pascal_by_raw: HashMap::new(),
+            pascals_used: HashSet::new(),
         };
 
         // Pre-pass: build $id registry by walking the entire schema tree
@@ -236,7 +264,7 @@ impl Converter {
             // register it as a def so other schemas can reference it
             let root_def_name = uri_to_def_name(base);
             if c.recursive_refs.contains(&root_def_name) {
-                let pascal = crate::util::to_pascal_case(&root_def_name);
+                let pascal = c.def_pascal(&root_def_name);
                 c.converted_defs.insert(root_def_name.clone(), root_ir.clone());
                 c.defs
                     .entry(root_def_name)
@@ -258,13 +286,18 @@ impl Converter {
 
         // Build ordered defs using topological sort so that dependencies are
         // emitted before the defs that reference them.
-        let sorted_names = topological_sort_defs(&def_names, &c.converted_defs);
+        let pascal_to_raw: HashMap<String, String> = def_names
+            .iter()
+            .map(|n| (c.def_pascal(n), n.clone()))
+            .collect();
+        let sorted_names = topological_sort_defs(&def_names, &c.converted_defs, &pascal_to_raw);
         let mut defs = Vec::new();
         for name in &sorted_names {
+            let pascal = c.def_pascal(name);
             if let Some(ir) = c.converted_defs.get(name) {
                 let is_recursive = c.recursive_refs.contains(name);
                 defs.push(DefEntry {
-                    name: crate::util::to_pascal_case(name),
+                    name: pascal,
                     schema: ir.clone(),
                     is_recursive,
                 });
@@ -639,7 +672,7 @@ impl Converter {
 
                 // Derive a stable name from the URI for use as a def
                 let def_name = uri_to_def_name(uri_part);
-                let pascal = crate::util::to_pascal_case(&def_name);
+                let pascal = self.def_pascal(&def_name);
 
                 // Check for cycles
                 let key = uri_part.to_string();
@@ -733,11 +766,13 @@ impl Converter {
 
         if self.visiting.contains(&name) {
             self.recursive_refs.insert(name.clone());
-            return Ok(SchemaIr::Lazy(crate::util::to_pascal_case(&name)));
+            let pascal = self.def_pascal(&name);
+            return Ok(SchemaIr::Lazy(pascal));
         }
 
         if self.converted_defs.contains_key(&name) {
-            return Ok(SchemaIr::Ref(crate::util::to_pascal_case(&name)));
+            let pascal = self.def_pascal(&name);
+            return Ok(SchemaIr::Ref(pascal));
         }
 
         if let Some(def_schema) = self.defs.get(&name).cloned() {
@@ -745,7 +780,8 @@ impl Converter {
             let ir = self.convert_schema(&def_schema)?;
             self.visiting.remove(&name);
             self.converted_defs.insert(name.clone(), ir);
-            Ok(SchemaIr::Ref(crate::util::to_pascal_case(&name)))
+            let pascal = self.def_pascal(&name);
+            Ok(SchemaIr::Ref(pascal))
         } else {
             Ok(SchemaIr::Unknown)
         }
@@ -1412,12 +1448,10 @@ fn collect_refs_inner(ir: &SchemaIr, out: &mut HashSet<String>) {
 fn topological_sort_defs(
     def_names: &[String],
     converted_defs: &HashMap<String, SchemaIr>,
+    // PascalCase name → raw name, using the converter's collision-free
+    // assignment so refs resolve to the right def.
+    pascal_to_raw: &HashMap<String, String>,
 ) -> Vec<String> {
-    // Build a map from PascalCase name → raw name for quick reverse lookup.
-    let pascal_to_raw: HashMap<String, String> = def_names
-        .iter()
-        .map(|n| (crate::util::to_pascal_case(n), n.clone()))
-        .collect();
 
     // Build adjacency list: raw_name → set of raw names it depends on.
     // An edge (A depends on B) means B must be emitted before A.

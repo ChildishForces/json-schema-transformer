@@ -81,7 +81,7 @@ struct Args {
     target: Vec<Target>,
 
     /// Name used for generated type names (default: the schema's root "title",
-    /// falling back to the input file stem). Single-file mode only.
+    /// falling back to the input file stem). Requires exactly one schema.
     #[arg(short, long)]
     name: Option<String>,
 
@@ -127,6 +127,8 @@ fn schema_title(schema: &serde_json::Value) -> Option<String> {
 }
 
 /// Recursively collect *.json files under `dir`, sorted for determinism.
+/// Symlinked directories are not followed (prevents cycles and duplicated
+/// output); symlinked .json files are included.
 fn walk_json_files(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
@@ -134,10 +136,23 @@ fn walk_json_files(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
         let entries = std::fs::read_dir(&current)
             .with_context(|| format!("failed to read directory {}", current.display()))?;
         for entry in entries {
-            let path = entry?.path();
-            if path.is_dir() {
+            let entry = entry?;
+            let path = entry.path();
+            let file_type = entry
+                .file_type()
+                .with_context(|| format!("failed to stat {}", path.display()))?;
+            let is_json = path.extension().is_some_and(|e| e == "json");
+            if file_type.is_dir() {
                 stack.push(path);
-            } else if path.extension().is_some_and(|e| e == "json") {
+            } else if file_type.is_symlink() {
+                // Resolve the link target's type without recursing into
+                // symlinked directories.
+                let meta = std::fs::metadata(&path)
+                    .with_context(|| format!("failed to resolve symlink {}", path.display()))?;
+                if meta.is_file() && is_json {
+                    files.push(path);
+                }
+            } else if is_json {
                 files.push(path);
             }
         }
@@ -218,12 +233,18 @@ fn main() -> anyhow::Result<()> {
         bail!("no .json schema files found in the given inputs");
     }
 
+    // --name applies whenever exactly one schema results — including a
+    // directory input containing a single file (previously silently ignored).
+    if let Some(name) = &args.name {
+        if inputs.len() > 1 {
+            bail!("--name is ambiguous with multiple schemas; use per-schema \"title\"s");
+        }
+        inputs[0].name = name.clone();
+    }
+
     let collection = args.out_dir.is_some() || inputs.len() > 1 || has_dir_input;
     if collection && args.out_dir.is_none() {
         bail!("multiple schemas or directory inputs require --out-dir");
-    }
-    if collection && args.name.is_some() && inputs.len() > 1 {
-        bail!("--name is ambiguous with multiple schemas; use per-schema \"title\"s");
     }
     if !collection && args.helpers_file.is_some() {
         bail!("--helpers-file only applies in collection mode (--out-dir); single-file output always inlines helpers");
@@ -241,18 +262,41 @@ fn main() -> anyhow::Result<()> {
     if targets.len() > 1 && args.out_dir.is_none() {
         bail!("multiple targets require --out-dir");
     }
-    if args.helpers_file.is_some() && targets.len() > 1 {
-        bail!("a custom --helpers-file name only makes sense with a single target");
+    if let Some(custom) = &args.helpers_file {
+        if targets.len() > 1 {
+            bail!("a custom --helpers-file name only makes sense with a single target");
+        }
+        // The name lands in imports (`from {stem} import`, `use {stem}::*`)
+        // — validate it up front instead of emitting broken code.
+        let emitter = targets[0].emitter();
+        let Some(default) = emitter.default_helpers_file() else {
+            bail!("this target emits no runtime helpers; --helpers-file does not apply");
+        };
+        let expected_ext = default.rsplit('.').next().unwrap_or_default();
+        let Some(stem) = custom.strip_suffix(&format!(".{expected_ext}")) else {
+            bail!("--helpers-file for this target must end with .{expected_ext} (e.g. {default})");
+        };
+        let module_safe = !stem.is_empty()
+            && stem
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && stem
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+        let needs_identifier = matches!(targets[0], Target::Pydantic | Target::Rust);
+        if !module_safe || (needs_identifier && stem.contains('-')) {
+            bail!(
+                "--helpers-file stem \"{stem}\" is not importable for this target; use letters, digits and underscores"
+            );
+        }
     }
 
     if !collection {
         // Single-file mode: one self-contained module to --out or stdout.
         let input = &inputs[0];
         let converted = Converter::convert(&input.schema).context("conversion failed")?;
-        let options = EmitOptions {
-            helpers: None,
-            mutable: args.mutable,
-        };
+        let options = EmitOptions::new().with_mutable(args.mutable);
         for target in &targets {
             let emitter = target.emitter();
             let output = emitter.emit_with_options(&converted, &input.name, &options);
@@ -277,20 +321,42 @@ fn main() -> anyhow::Result<()> {
         }
         .mutable(args.mutable);
 
-        let mut written: HashMap<PathBuf, &str> = HashMap::new();
+        // Pre-flight: compute and collision-check every output path before
+        // writing anything. Paths are compared case-insensitively because
+        // common filesystems (APFS, NTFS) are — two stems differing only in
+        // case would silently overwrite each other. The shared helpers file
+        // name is reserved up front so a schema can't clobber it (or vice
+        // versa).
+        let mut planned: Vec<(PathBuf, &SchemaInput)> = Vec::new();
+        let mut claimed: HashMap<String, String> = HashMap::new();
         for input in &inputs {
             let path = out_dir
                 .join(&input.rel_dir)
                 .join(format!("{}.{}", target.stem(&input.name), emitter.extension()));
-            if let Some(previous) = written.insert(path.clone(), &input.source) {
+            let key = path.to_string_lossy().to_lowercase();
+            if let Some(previous) = claimed.insert(key, input.source.clone()) {
                 bail!(
-                    "output collision: {} would be written by both {} and {}",
+                    "output collision: {} would be written by both {} and {} (paths are compared case-insensitively)",
                     path.display(),
                     previous,
                     input.source
                 );
             }
+            planned.push((path, input));
+        }
+        if let Some(helpers_name) = session.helpers_file_name() {
+            let helpers_path = out_dir.join(helpers_name);
+            let key = helpers_path.to_string_lossy().to_lowercase();
+            if let Some(previous) = claimed.get(&key) {
+                bail!(
+                    "output collision: the shared helpers file {} would clash with the module generated from {}; rename the schema or pass a different --helpers-file",
+                    helpers_path.display(),
+                    previous
+                );
+            }
+        }
 
+        for (path, input) in &planned {
             let converted = Converter::convert(&input.schema)
                 .with_context(|| format!("conversion failed for {}", input.source))?;
             let dir_prefix = "../".repeat(input.rel_dir.components().count());
@@ -299,7 +365,7 @@ fn main() -> anyhow::Result<()> {
             let dir = path.parent().expect("output path has a parent");
             std::fs::create_dir_all(dir)
                 .with_context(|| format!("failed to create {}", dir.display()))?;
-            std::fs::write(&path, &output)
+            std::fs::write(path, &output)
                 .with_context(|| format!("failed to write {}", path.display()))?;
             eprintln!("wrote {}", path.display());
         }

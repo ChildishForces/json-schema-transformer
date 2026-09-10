@@ -28,7 +28,17 @@ const SIGNATURE_HELPER_TYPES: &[&str] = &[
     // generated type, so inline mode prefixes it per file like the wrappers.
     // No other generated identifier contains this substring.
     "Validatable",
+    // AnyCodable appears in stored-property signatures and is emitted inline
+    // (non-private) so single-file output is self-contained; prefixing keeps
+    // many files batch-compilable into one module.
+    "AnyCodable",
 ];
+
+/// Inlined validation round-trip for manual object initializers. Not a
+/// `validate()` call — a schema property named "validate" would shadow the
+/// protocol method and break compilation. Mirrors the Validatable extension's
+/// matched ISO-8601 encoder/decoder pair.
+const MANUAL_INIT_ROUNDTRIP: &str = "        let __jstEncoder = JSONEncoder()\n        __jstEncoder.dateEncodingStrategy = .iso8601\n        let __jstDecoder = JSONDecoder()\n        __jstDecoder.dateDecodingStrategy = .iso8601\n        _ = try __jstDecoder.decode(Self.self, from: __jstEncoder.encode(self))";
 
 pub struct SwiftEmitter;
 
@@ -162,7 +172,13 @@ impl SwiftEmitter {
     ) -> (String, HelperSet) {
         // Reset global sub-schema counter for each emit
         SUB_SCHEMA_COUNTER.store(0, Ordering::Relaxed);
-        let pascal = to_pascal_case(name);
+        // Root names hitting a reserved type name ("Validatable", "Error", …)
+        // get the same "Schema" suffix as defs — a schema titled
+        // "Validatable" must not collide with the protocol.
+        let mut pascal = to_pascal_case(name);
+        if SWIFT_RESERVED_TYPES.contains(&pascal.as_str()) {
+            pascal = format!("{pascal}Schema");
+        }
         // Prefix $defs type names per file so many files can share one module.
         TYPE_PREFIX.with(|p| *p.borrow_mut() = pascal.clone());
         let mut out = String::new();
@@ -199,6 +215,8 @@ impl SwiftEmitter {
         // so a targeted textual rewrite keeps the emit call graph untouched.
         if options.mutable {
             body = body.replace("\n    let ", "\n    var ");
+            // Interpreted roots store their value as `private let`.
+            body = body.replace("\n    private let ", "\n    private var ");
         }
 
         // Detect which helpers this module references (drives inline emission
@@ -275,6 +293,13 @@ impl SwiftEmitter {
             out.push_str(SERIALIZE_ANY_HELPER);
             out.push('\n');
         }
+        // AnyCodable appears in stored-property signatures, so it is emitted
+        // non-private and per-file prefixed (SIGNATURE_HELPER_TYPES) — this
+        // makes single-file output fully self-contained.
+        if helpers.needs_any_codable {
+            out.push_str(ANY_CODABLE_HELPER);
+            out.push('\n');
+        }
         if helpers.needs_interpreter {
             out.push_str(JSI_SWIFT_HELPER);
             out.push('\n');
@@ -286,10 +311,19 @@ impl SwiftEmitter {
         // per file: they appear in stored-property/typealias signatures of the
         // internal root type, so they cannot be `private` — renaming them keeps
         // every generated file safe to compile into one shared module.
+        // (String literals are immune: swift_escape encodes helper-name
+        // occurrences in schema strings with \u{...} escapes.) When the root
+        // prefix itself contains the helper name, "{prefix}{helper}" would
+        // rewrite the root type's own identifier — use a "Jst" prefix instead.
         let prefix = pascal.clone();
         for helper in SIGNATURE_HELPER_TYPES {
             if out.contains(helper) {
-                out = out.replace(helper, &format!("{prefix}{helper}"));
+                let target = if prefix.contains(helper) {
+                    format!("Jst{helper}")
+                } else {
+                    format!("{prefix}{helper}")
+                };
+                out = out.replace(helper, &target);
             }
         }
         (out, helpers.to_helper_set())
@@ -481,7 +515,7 @@ const SERIALIZE_ANY_HELPER: &str = include_str!("serialize_any.swift");
 
 /// Canonical AnyCodable (JSON value box with bool/Int/Double distinction via
 /// ordered decode attempts). Only used in the shared helpers file — inline
-/// mode expects the consumer to provide AnyCodable (historical behavior).
+/// mode emits it per file (prefixed) so output is self-contained.
 const ANY_CODABLE_HELPER: &str = include_str!("any_codable.swift");
 
 /// Self-contained draft 2020-12 mini-validator with annotation tracking,
@@ -496,7 +530,8 @@ const JSI_SWIFT_HELPER: &str = include_str!("jsi_validator.swift");
 /// Escape a string for use in a Swift string literal.
 /// Handles all control characters using Swift's \u{XX} syntax.
 fn swift_escape(s: &str) -> String {
-    s.chars()
+    let escaped: String = s
+        .chars()
         .flat_map(|c| match c {
             '"' => vec!['\\', '"'],
             '\\' => vec!['\\', '\\'],
@@ -509,7 +544,30 @@ fn swift_escape(s: &str) -> String {
             }
             other => vec![other],
         })
-        .collect()
+        .collect();
+    protect_helper_names(escaped)
+}
+
+/// The per-file helper-type rename (`SIGNATURE_HELPER_TYPES` loop in
+/// `emit_module`) is a plain text replace over the whole generated file, so a
+/// schema string that happens to contain a helper name ("Validatable",
+/// "EmailAddress", …) would be silently rewritten — corrupting const/enum
+/// comparisons. Protect string-literal content by encoding the first
+/// character of any helper-name occurrence as a Swift `\u{XXXX}` escape:
+/// identical at runtime, invisible to the rename.
+fn protect_helper_names(mut s: String) -> String {
+    for helper in SIGNATURE_HELPER_TYPES {
+        if s.contains(helper) {
+            let first = helper.chars().next().expect("helper names are non-empty");
+            let replacement = format!(
+                "\\u{{{:04X}}}{}",
+                first as u32,
+                &helper[first.len_utf8()..]
+            );
+            s = s.replace(helper, &replacement);
+        }
+    }
+    s
 }
 
 // ── Name sanitization ───────────────────────────────────────────────────────
@@ -524,7 +582,7 @@ const SWIFT_RESERVED_TYPES: &[&str] = &[
     "Error", "Result", "Data", "Date", "URL", "UUID",
     "Codable", "Decodable", "Encodable",
     "Equatable", "Hashable", "Comparable",
-    "Type",
+    "Type", "Validatable",
 ];
 
 fn sanitize_swift_name(name: &str) -> String {
@@ -823,9 +881,40 @@ fn emit_struct(name: &str, ir: &SchemaIr, defs: &[DefEntry]) -> String {
                 lines.push("    }".to_string());
             }
 
+            // Required fields with optional Swift types (`String?` for
+            // required-but-nullable, `Never?` for null-typed) are decoded
+            // with presence-enforcing container.decode — synthesized encoding
+            // would OMIT nil for them, so a legitimately decoded {"x":null}
+            // would fail validate()'s round-trip (keyNotFound) and the manual
+            // init could never build a nil-valued instance. Emit a custom
+            // encode(to:) writing explicit nulls for those fields; genuinely
+            // optional fields keep omit-when-nil behavior.
+            if has_required_optional_typed {
+                lines.push(String::new());
+                lines.push("    func encode(to encoder: Encoder) throws {".to_string());
+                lines.push(
+                    "        var container = encoder.container(keyedBy: CodingKeys.self)"
+                        .to_string(),
+                );
+                for (_, swift_name, _, optional, _) in &fields_info {
+                    if *optional {
+                        lines.push(format!(
+                            "        try container.encodeIfPresent({swift_name}, forKey: .{swift_name})"
+                        ));
+                    } else {
+                        lines.push(format!(
+                            "        try container.encode({swift_name}, forKey: .{swift_name})"
+                        ));
+                    }
+                }
+                lines.push("    }".to_string());
+            }
+
             // Manual throwing initializer: store the fields, then validate
-            // via the Codable round-trip. Safe from recursion — validate()
-            // decodes through init(from:), a different initializer.
+            // via the Codable round-trip. Safe from recursion — the decode
+            // goes through init(from:), a different initializer. The
+            // round-trip is inlined rather than calling `validate()` so a
+            // property named "validate" cannot shadow the protocol method.
             let params: Vec<String> = fields_info
                 .iter()
                 .map(|(_, swift_name, field_type, optional, _)| {
@@ -841,7 +930,7 @@ fn emit_struct(name: &str, ir: &SchemaIr, defs: &[DefEntry]) -> String {
             for (_, swift_name, _, _, _) in &fields_info {
                 lines.push(format!("        self.{swift_name} = {swift_name}"));
             }
-            lines.push("        try validate()".to_string());
+            lines.push(MANUAL_INIT_ROUNDTRIP.to_string());
             lines.push("    }".to_string());
 
             lines.push("}".to_string());
@@ -2239,7 +2328,10 @@ mod tests {
             out.contains("init(id: String, quantity: Int, tags: [String]? = nil) throws {"),
             "{out}"
         );
-        assert!(out.contains("        try validate()"), "{out}");
+        assert!(
+            out.contains("__jstDecoder.decode(Self.self, from: __jstEncoder.encode(self))"),
+            "{out}"
+        );
         // Stored properties stay immutable by default (`var isValid` in the
         // protocol snippet is a computed property, not a stored one).
         assert!(out.contains("\n    let id: String"), "{out}");

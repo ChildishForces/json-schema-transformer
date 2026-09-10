@@ -3,11 +3,15 @@ protocol Validatable: Codable {
 }
 
 extension Validatable {
-    /// Round-trips through the validating decoder — a matched default
-    /// JSONEncoder/JSONDecoder pair, so Date and friends stay consistent.
+    /// Round-trips through the validating decoder — a matched ISO-8601
+    /// JSONEncoder/JSONDecoder pair, so `Date` fields survive the trip and
+    /// serialize as schema-valid RFC 3339 strings.
     func validate() throws {
-        let data = try JSONEncoder().encode(self)
-        _ = try JSONDecoder().decode(Self.self, from: data)
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        _ = try decoder.decode(Self.self, from: encoder.encode(self))
     }
 
     var isValid: Bool { (try? validate()) != nil }
@@ -16,6 +20,8 @@ extension Validatable {
     /// validate (validate() itself encodes — hooking encode would recurse).
     func validatedJSONData() throws -> Data {
         try validate()
-        return try JSONEncoder().encode(self)
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        return try encoder.encode(self)
     }
 }

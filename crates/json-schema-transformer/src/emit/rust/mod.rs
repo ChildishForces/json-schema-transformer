@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use super::{module_header, EmitOptions, Emitter, HelperSet};
+use super::{module_header, sanitize_comment_text, EmitOptions, Emitter, HelperSet};
 use crate::ir::*;
 use crate::util::{to_pascal_case, to_snake_case};
 
@@ -8,7 +8,7 @@ pub struct RustEmitter;
 
 /// JSON-value equality (`_jst_eq`) and canonical stringify (`_jst_canonical`).
 const EQ_HELPER_RS: &str = include_str!("eq.rs");
-/// Numeric predicates: `_jst_is_integer`, `_jst_as_f64`, `_jst_multiple_of`.
+/// Numeric predicates: `_jst_is_integer`, `_jst_multiple_of`.
 const NUM_HELPER_RS: &str = include_str!("num.rs");
 /// String-format predicates (`_jst_is_email`, `_jst_is_uuid`, ...).
 const FORMATS_HELPER_RS: &str = include_str!("formats.rs");
@@ -179,15 +179,49 @@ impl RustEmitter {
     }
 }
 
+/// Strip double-quoted string literals and doc-comment lines so helper
+/// detection cannot false-positive on schema-derived text (a const string or
+/// description containing "_jst_jsi_validate(" would otherwise pull the
+/// interpreter in as dead code). Generated code never uses raw strings —
+/// `esc()` escapes quotes and backslashes — so a simple scanner suffices.
+fn strip_schema_text(body: &str) -> String {
+    let mut out = String::with_capacity(body.len());
+    for line in body.lines() {
+        if line.trim_start().starts_with("///") {
+            continue;
+        }
+        let mut in_str = false;
+        let mut escaped = false;
+        for c in line.chars() {
+            if in_str {
+                if escaped {
+                    escaped = false;
+                } else if c == '\\' {
+                    escaped = true;
+                } else if c == '"' {
+                    in_str = false;
+                    out.push('"');
+                }
+            } else {
+                out.push(c);
+                if c == '"' {
+                    in_str = true;
+                }
+            }
+        }
+        out.push('\n');
+    }
+    out
+}
+
 fn detect_needs(body: &str) -> HelperSet {
+    let body = strip_schema_text(body);
+    let body = body.as_str();
     let mut needs = HelperSet::default();
     if body.contains("_jst_eq(") || body.contains("_jst_canonical(") {
         needs.insert("eq");
     }
-    if body.contains("_jst_is_integer(")
-        || body.contains("_jst_as_f64(")
-        || body.contains("_jst_multiple_of(")
-    {
+    if body.contains("_jst_is_integer(") || body.contains("_jst_multiple_of(") {
         needs.insert("num");
     }
     const FORMAT_FNS: [&str; 12] = [
@@ -287,6 +321,15 @@ fn field_ident(key: &str, used: &mut HashSet<String>) -> String {
     if base.chars().next().is_some_and(|c| c.is_ascii_digit()) {
         base.insert(0, 'n');
     }
+    // Apply the keyword transform BEFORE deduplicating, and dedupe on the
+    // FINAL ident: mapping `crate` → `crate_` after the dedupe set was
+    // updated would collide with a sibling property literally named
+    // `crate_` (two `pub crate_` fields → E0124).
+    let base = match base.as_str() {
+        "crate" | "self" | "super" => format!("{base}_"),
+        b if RUST_KEYWORDS.contains(&b) => format!("r#{base}"),
+        _ => base,
+    };
     let mut candidate = base.clone();
     let mut i = 1;
     while used.contains(&candidate) {
@@ -294,15 +337,15 @@ fn field_ident(key: &str, used: &mut HashSet<String>) -> String {
         candidate = format!("{base}_{i}");
     }
     used.insert(candidate.clone());
-    match candidate.as_str() {
-        "crate" | "self" | "super" => format!("{candidate}_"),
-        c if RUST_KEYWORDS.contains(&c) => format!("r#{candidate}"),
-        _ => candidate,
-    }
+    candidate
 }
 
 fn doc_comment(text: &str) -> String {
-    text.lines()
+    // Descriptions are arbitrary schema strings: strip bare CRs (hard rustc
+    // error in doc comments) and bidi controls (deny-by-default lint) while
+    // keeping newlines for the multi-line handling below.
+    sanitize_comment_text(text)
+        .lines()
         .map(|l| format!("/// {}\n", l.trim_end()))
         .collect()
 }
@@ -332,6 +375,23 @@ impl Ctx<'_> {
 
 // ── Definition dispatch ─────────────────────────────────────────────────────
 
+/// Typed structs only keep declared properties, so re-serialization drops any
+/// unknown keys the schema permits. That lossiness is fine for every object
+/// constraint except `minProperties`: dropping keys can only make
+/// maxProperties/patternProperties/propertyNames/dependent* EASIER to satisfy,
+/// but it can turn a `minProperties`-satisfying instance into a failing one —
+/// a freshly decoded value would then fail `validate()`. When (a) the object
+/// can retain unknown keys (additionalProperties allowed or schema-checked,
+/// or any patternProperties) AND (b) `minProperties` is set, fall back to the
+/// newtype-over-Value shape, which keeps full raw fidelity.
+fn object_can_lose_min_properties(obj: &ObjectSchema) -> bool {
+    let retains_unknown_keys = matches!(
+        obj.additional_properties,
+        AdditionalProperties::Allowed | AdditionalProperties::Schema(_)
+    ) || !obj.pattern_properties.is_empty();
+    retains_unknown_keys && obj.min_properties.is_some()
+}
+
 fn emit_definition(name: &str, ir: &SchemaIr, ctx: &mut Ctx) -> String {
     // Default/Describe are transparent wrappers; Describe adds a doc comment.
     let mut doc = String::new();
@@ -348,7 +408,11 @@ fn emit_definition(name: &str, ir: &SchemaIr, ctx: &mut Ctx) -> String {
     }
 
     let code = match inner {
-        SchemaIr::Object(obj) if !obj.fields.is_empty() => emit_struct(name, obj, ctx),
+        SchemaIr::Object(obj)
+            if !obj.fields.is_empty() && !object_can_lose_min_properties(obj) =>
+        {
+            emit_struct(name, obj, ctx)
+        }
         SchemaIr::Enum(cases) if !cases.is_empty() => emit_enum(name, cases),
         SchemaIr::Ref(target) => {
             let safe = sanitize_rust_name(target, &ctx.prefix);
@@ -422,8 +486,14 @@ fn emit_newtype(name: &str, ir: &SchemaIr, ctx: &mut Ctx) -> String {
 
 fn emit_enum(name: &str, cases: &[String]) -> String {
     let mut used: HashSet<String> = HashSet::new();
+    let mut seen_raw: HashSet<&str> = HashSet::new();
     let mut variants = Vec::new(); // (variant_name, raw_value)
     for c in cases {
+        // Duplicate enum values are legal JSON Schema but would emit an
+        // unreachable match arm and a duplicate #[serde(rename)].
+        if !seen_raw.insert(c.as_str()) {
+            continue;
+        }
         let mut vname = to_pascal_case(c);
         if vname.is_empty() {
             vname = "Value".to_string();
@@ -636,7 +706,10 @@ fn extraction(
                 (t.clone(), format!("{t}::_jst_from_value({x})?"))
             }
         }
-        SchemaIr::Object(o) if !o.fields.is_empty() => {
+        // Same lossiness guard as emit_definition: a nested typed struct would
+        // drop unknown keys on the parent's re-serialization and could break
+        // `validate()` under minProperties; hold the raw value instead.
+        SchemaIr::Object(o) if !o.fields.is_empty() && !object_can_lose_min_properties(o) => {
             let nested = ctx.unique_type_name(&format!("{owner}{hint}"));
             let code = emit_struct(&nested, o, ctx);
             ctx.extra.push(code);
@@ -1009,13 +1082,38 @@ fn literal_check(lit: &LiteralValue, var: &str) -> String {
         LiteralValue::Bool(b) => format!("matches!({var}.as_bool(), Some({b}))"),
         LiteralValue::Null => format!("{var}.is_null()"),
         // Integer literals match both 5 and 5.0 (numbers compare
-        // mathematically); the as_i64 arm keeps huge values exact.
-        LiteralValue::Integer(i) => bool_closure(
-            &format!("v.as_i64() == Some({i}i64) || v.as_f64() == Some({i}f64)"),
-            var,
-        ),
+        // mathematically, mirroring _jst_eq): integer-typed instances
+        // (i64/u64) compare EXACTLY — the f64 fallback would wrongly accept
+        // neighbors that round to the same double (e.g. 2^53 vs 2^53+1, or
+        // i64::MAX vs the u64 above it). Only float-typed instances use the
+        // f64 comparison, so 5.0 still matches const 5.
+        LiteralValue::Integer(i) => {
+            // A float instance can only mathematically equal the literal when
+            // the literal is exactly representable as f64 — decided here at
+            // generation time so the emitted check stays branch-simple.
+            let float_arm = if (*i as f64) as i64 == *i {
+                format!("n.as_f64() == Some({i}f64)")
+            } else {
+                "false".to_string()
+            };
+            bool_closure(
+                &format!(
+                    "match v {{\n    serde_json::Value::Number(n) => {{\n        if let Some(x) = n.as_i64() {{ x == {i}i64 }}\n        else if n.as_u64().is_some() {{ false }}\n        else {{ {float_arm} }}\n    }}\n    _ => false,\n}}"
+                ),
+                var,
+            )
+        }
         LiteralValue::Number(n) => {
-            bool_closure(&format!("v.as_f64() == Some({})", fmt_f64(*n)), var)
+            // Mirror the Integer arm: integer-typed instances compare via
+            // round-trip exactness so e.g. const 9007199254740992.0 does not
+            // accept the integer 2^53+1 (whose f64 rounding coincides).
+            let nf = fmt_f64(*n);
+            bool_closure(
+                &format!(
+                    "match v {{\n    serde_json::Value::Number(n) => {{\n        if let Some(x) = n.as_i64() {{ (x as f64) == {nf} && ({nf} as i64) == x }}\n        else if let Some(x) = n.as_u64() {{ (x as f64) == {nf} && ({nf} as u64) == x }}\n        else {{ n.as_f64() == Some({nf}) }}\n    }}\n    _ => false,\n}}"
+                ),
+                var,
+            )
         }
     }
 }

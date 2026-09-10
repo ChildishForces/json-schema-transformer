@@ -2,13 +2,6 @@ use crate::ir::*;
 use crate::util::{escape_string, to_pascal_case, to_snake_case};
 use super::{EmitOptions, Emitter, HelperSet, needs_python_quoting};
 
-thread_local! {
-    /// When set (--mutable), dataclasses re-validate on attribute assignment
-    /// via pydantic's validate_assignment config. Pydantic dataclasses are
-    /// already mutable; this closes the mutate-without-revalidation hole.
-    static MUTABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
 pub struct PydanticEmitter;
 
 /// Tracks which Python imports/features the generated module needs.
@@ -146,7 +139,6 @@ impl PydanticEmitter {
         name: &str,
         options: &EmitOptions,
     ) -> (String, HelperSet) {
-        MUTABLE.with(|m| m.set(options.mutable));
         let pascal = to_pascal_case(name);
         let mut features = ModuleFeatures::default();
 
@@ -166,6 +158,7 @@ impl PydanticEmitter {
                 &def.schema,
                 &converted.defs,
                 &mut counter,
+                options.mutable,
             ));
         }
         let root_block = emit_definition(
@@ -173,6 +166,7 @@ impl PydanticEmitter {
             &converted.root,
             &converted.defs,
             &mut counter,
+            options.mutable,
         );
 
         // Assemble the body (definitions + root) first so that in shared-helpers
@@ -536,14 +530,15 @@ fn emit_definition(
     ir: &SchemaIr,
     defs: &[DefEntry],
     counter: &mut usize,
+    mutable: bool,
 ) -> String {
     match ir {
         SchemaIr::Interpreted { schema, remotes } => {
             emit_interpreted(name, schema, remotes, counter)
         }
-        SchemaIr::Object(obj) => emit_object_class(name, obj, defs, counter),
-        SchemaIr::TypeGuarded(guards) => emit_type_guarded(name, guards, defs, counter),
-        SchemaIr::Not { base, not_schema } => emit_not(name, base, not_schema, defs, counter),
+        SchemaIr::Object(obj) => emit_object_class(name, obj, defs, counter, mutable),
+        SchemaIr::TypeGuarded(guards) => emit_type_guarded(name, guards, defs, counter, mutable),
+        SchemaIr::Not { base, not_schema } => emit_not(name, base, not_schema, defs, counter, mutable),
         SchemaIr::Conditional {
             base,
             if_schema,
@@ -557,6 +552,7 @@ fn emit_definition(
             else_schema.as_deref(),
             defs,
             counter,
+            mutable,
         ),
         SchemaIr::Enum(cases) if cases.is_empty() => emit_never(name, counter),
         SchemaIr::Literal(lit) => emit_literal(name, lit, counter),
@@ -564,34 +560,34 @@ fn emit_definition(
         SchemaIr::ComplexEnum(values) => emit_complex_enum(name, values, counter),
         SchemaIr::MixedEnum(lits) => emit_mixed_enum(name, lits, counter),
         SchemaIr::Union(members) if members.len() > 1 => {
-            emit_union(name, members, defs, counter)
+            emit_union(name, members, defs, counter, mutable)
         }
         SchemaIr::ExclusiveUnion(members) => {
-            emit_exclusive_union(name, members, defs, counter)
+            emit_exclusive_union(name, members, defs, counter, mutable)
         }
         SchemaIr::Intersection(members) if members.len() == 1 => {
-            emit_definition(name, &members[0], defs, counter)
+            emit_definition(name, &members[0], defs, counter, mutable)
         }
         SchemaIr::Intersection(members) if members.len() > 1 => {
-            emit_intersection(name, members, defs, counter)
+            emit_intersection(name, members, defs, counter, mutable)
         }
         SchemaIr::Array(arr) if arr.unique_items || arr.contains.is_some() => {
-            emit_constrained_array(name, arr, defs, counter)
+            emit_constrained_array(name, arr, defs, counter, mutable)
         }
-        SchemaIr::Tuple(tuple) => emit_constrained_tuple(name, tuple, defs, counter),
+        SchemaIr::Tuple(tuple) => emit_constrained_tuple(name, tuple, defs, counter, mutable),
         SchemaIr::Never => emit_never(name, counter),
         SchemaIr::Ref(ref_name) => {
             // Direct reference to a named def — use the actual type, not a string
             format!("{name} = {ref_name}")
         }
         SchemaIr::Describe(inner, _) | SchemaIr::Default(inner, _) => {
-            emit_definition(name, inner, defs, counter)
+            emit_definition(name, inner, defs, counter, mutable)
         }
         SchemaIr::Nullable(inner) => {
             if matches!(inner.as_ref(), SchemaIr::Object(_)) {
                 *counter += 1;
                 let inner_name = format!("_Inner{}", *counter);
-                let inner_def = emit_definition(&inner_name, inner, defs, counter);
+                let inner_def = emit_definition(&inner_name, inner, defs, counter, mutable);
                 format!("{inner_def}\n\n{name} = Optional[{inner_name}]")
             } else {
                 format!("{name} = Optional[{}]", annotated_type(inner, defs))
@@ -684,6 +680,7 @@ fn emit_object_class(
     obj: &ObjectSchema,
     defs: &[DefEntry],
     counter: &mut usize,
+    mutable: bool,
 ) -> String {
     let mut preamble = String::new();
 
@@ -703,7 +700,6 @@ fn emit_object_class(
     // With patternProperties, we need to allow extra keys and validate manually
     let effective_forbid = forbid_extra && !has_pattern_props;
 
-    let mutable = MUTABLE.with(|m| m.get());
     let config = if has_aliases || effective_forbid || mutable {
         let mut config_parts = Vec::new();
         if has_aliases {
@@ -789,7 +785,7 @@ fn emit_object_class(
             // patternProperties
             for (pattern, schema) in &obj.pattern_properties {
                 let (sub_preamble, sub_type) =
-                    emit_sub_schema("pp", schema, defs, counter);
+                    emit_sub_schema("pp", schema, defs, counter, mutable);
                 if !sub_preamble.is_empty() {
                     preamble.push_str(&sub_preamble);
                     preamble.push('\n');
@@ -872,7 +868,7 @@ fn emit_object_class(
             // dependentSchemas
             for (prop, schema) in &obj.dependent_schemas {
                 let (sub_preamble, sub_type) =
-                    emit_sub_schema("ds", schema, defs, counter);
+                    emit_sub_schema("ds", schema, defs, counter, mutable);
                 if !sub_preamble.is_empty() {
                     preamble.push_str(&sub_preamble);
                     preamble.push('\n');
@@ -915,6 +911,7 @@ fn emit_type_guarded(
     guards: &[(TypeGuard, Box<SchemaIr>)],
     defs: &[DefEntry],
     counter: &mut usize,
+    mutable: bool,
 ) -> String {
     *counter += 1;
     let fn_name = format!("_validate_{}", counter);
@@ -933,11 +930,11 @@ fn emit_type_guarded(
                 emit_number_guard_checks(schema),
             ),
             TypeGuard::Object => {
-                let checks = emit_object_guard_checks(schema, defs, counter, &mut preamble);
+                let checks = emit_object_guard_checks(schema, defs, counter, &mut preamble, mutable);
                 ("isinstance(v, dict)", checks)
             }
             TypeGuard::Array => {
-                let checks = emit_array_guard_checks(schema, defs, counter, &mut preamble);
+                let checks = emit_array_guard_checks(schema, defs, counter, &mut preamble, mutable);
                 ("isinstance(v, (list, tuple))", checks)
             }
         };
@@ -1032,12 +1029,13 @@ fn emit_object_guard_checks(
     defs: &[DefEntry],
     counter: &mut usize,
     preamble: &mut String,
+    mutable: bool,
 ) -> Vec<String> {
     // Handle Record type (additionalProperties as schema, no named properties)
     if let SchemaIr::Record(rec) = ir {
         let mut checks = Vec::new();
         if !matches!(rec.value.as_ref(), SchemaIr::Any | SchemaIr::Unknown) {
-            let (sub_preamble, sub_type) = emit_sub_schema("rv", &rec.value, defs, counter);
+            let (sub_preamble, sub_type) = emit_sub_schema("rv", &rec.value, defs, counter, mutable);
             if !sub_preamble.is_empty() {
                 preamble.push_str(&sub_preamble);
                 preamble.push('\n');
@@ -1109,7 +1107,7 @@ fn emit_object_guard_checks(
         if matches!(&f.schema, SchemaIr::Any | SchemaIr::Unknown) {
             continue;
         }
-        let (sub_preamble, sub_type) = emit_sub_schema("fg", &f.schema, defs, counter);
+        let (sub_preamble, sub_type) = emit_sub_schema("fg", &f.schema, defs, counter, mutable);
         if !sub_preamble.is_empty() {
             preamble.push_str(&sub_preamble);
             preamble.push('\n');
@@ -1127,7 +1125,7 @@ fn emit_object_guard_checks(
         let named_keys: Vec<String> = obj.fields.keys().map(|k| format!("\"{}\"", escape_string(k))).collect();
         let mut pp_lines = Vec::new();
         for (pattern, schema) in &obj.pattern_properties {
-            let (sub_preamble, sub_type) = emit_sub_schema("pp", schema, defs, counter);
+            let (sub_preamble, sub_type) = emit_sub_schema("pp", schema, defs, counter, mutable);
             if !sub_preamble.is_empty() {
                 preamble.push_str(&sub_preamble);
                 preamble.push('\n');
@@ -1149,7 +1147,7 @@ fn emit_object_guard_checks(
                 )
             }
             AdditionalProperties::Schema(ap_schema) => {
-                let (sub_preamble, sub_type) = emit_sub_schema("ap", ap_schema, defs, counter);
+                let (sub_preamble, sub_type) = emit_sub_schema("ap", ap_schema, defs, counter, mutable);
                 if !sub_preamble.is_empty() {
                     preamble.push_str(&sub_preamble);
                     preamble.push('\n');
@@ -1175,7 +1173,7 @@ fn emit_object_guard_checks(
     } else if let AdditionalProperties::Schema(ap_schema) = &obj.additional_properties {
         // additionalProperties with schema (no patternProperties)
         let named_keys: Vec<String> = obj.fields.keys().map(|k| format!("\"{}\"", escape_string(k))).collect();
-        let (sub_preamble, sub_type) = emit_sub_schema("ap", ap_schema, defs, counter);
+        let (sub_preamble, sub_type) = emit_sub_schema("ap", ap_schema, defs, counter, mutable);
         if !sub_preamble.is_empty() {
             preamble.push_str(&sub_preamble);
             preamble.push('\n');
@@ -1195,7 +1193,7 @@ fn emit_object_guard_checks(
 
     // propertyNames — use TypeAdapter for complex constraints
     if let Some(pn) = &obj.property_names {
-        let (sub_preamble, sub_type) = emit_sub_schema("pn", pn, defs, counter);
+        let (sub_preamble, sub_type) = emit_sub_schema("pn", pn, defs, counter, mutable);
         if !sub_preamble.is_empty() {
             preamble.push_str(&sub_preamble);
             preamble.push('\n');
@@ -1221,7 +1219,7 @@ fn emit_object_guard_checks(
 
     // dependentSchemas
     for (prop, schema) in &obj.dependent_schemas {
-        let (sub_preamble, sub_type) = emit_sub_schema("dsg", schema, defs, counter);
+        let (sub_preamble, sub_type) = emit_sub_schema("dsg", schema, defs, counter, mutable);
         if !sub_preamble.is_empty() {
             preamble.push_str(&sub_preamble);
             preamble.push('\n');
@@ -1243,6 +1241,7 @@ fn emit_array_guard_checks(
     defs: &[DefEntry],
     counter: &mut usize,
     preamble: &mut String,
+    mutable: bool,
 ) -> Vec<String> {
     let mut checks = Vec::new();
 
@@ -1252,7 +1251,7 @@ fn emit_array_guard_checks(
             if matches!(item, SchemaIr::Any) {
                 continue;
             }
-            let (sub_preamble, sub_type) = emit_sub_schema("tg", item, defs, counter);
+            let (sub_preamble, sub_type) = emit_sub_schema("tg", item, defs, counter, mutable);
             if !sub_preamble.is_empty() {
                 preamble.push_str(&sub_preamble);
                 preamble.push('\n');
@@ -1271,7 +1270,7 @@ fn emit_array_guard_checks(
             ));
         } else if let Some(rest) = &tuple.rest {
             if !matches!(rest.as_ref(), SchemaIr::Any) {
-                let (sub_preamble, sub_type) = emit_sub_schema("tgr", rest, defs, counter);
+                let (sub_preamble, sub_type) = emit_sub_schema("tgr", rest, defs, counter, mutable);
                 if !sub_preamble.is_empty() {
                     preamble.push_str(&sub_preamble);
                     preamble.push('\n');
@@ -1318,7 +1317,7 @@ fn emit_array_guard_checks(
         }
         if let Some(contains) = &arr.contains {
             let (sub_preamble, sub_type) =
-                emit_sub_schema("cg", &contains.schema, defs, counter);
+                emit_sub_schema("cg", &contains.schema, defs, counter, mutable);
             if !sub_preamble.is_empty() {
                 preamble.push_str(&sub_preamble);
                 preamble.push('\n');
@@ -1346,7 +1345,7 @@ fn emit_array_guard_checks(
 
         // Items type validation
         if !matches!(arr.items.as_ref(), SchemaIr::Any) {
-            let (sub_preamble, sub_type) = emit_sub_schema("ig", &arr.items, defs, counter);
+            let (sub_preamble, sub_type) = emit_sub_schema("ig", &arr.items, defs, counter, mutable);
             if !sub_preamble.is_empty() {
                 preamble.push_str(&sub_preamble);
                 preamble.push('\n');
@@ -1398,9 +1397,10 @@ fn emit_not(
     not_schema: &SchemaIr,
     defs: &[DefEntry],
     counter: &mut usize,
+    mutable: bool,
 ) -> String {
     let base_type = annotated_type(base, defs);
-    let (sub_preamble, sub_type) = emit_sub_schema("not", not_schema, defs, counter);
+    let (sub_preamble, sub_type) = emit_sub_schema("not", not_schema, defs, counter, mutable);
 
     *counter += 1;
     let ta_name = format!("_not_ta_{}", *counter);
@@ -1437,22 +1437,23 @@ fn emit_conditional(
     else_schema: Option<&SchemaIr>,
     defs: &[DefEntry],
     counter: &mut usize,
+    mutable: bool,
 ) -> String {
     let base_type = annotated_type(base, defs);
 
-    let (if_preamble, if_type) = emit_sub_schema("if", if_schema, defs, counter);
+    let (if_preamble, if_type) = emit_sub_schema("if", if_schema, defs, counter, mutable);
     *counter += 1;
     let if_ta = format!("_if_ta_{}", *counter);
 
     let then_ta = then_schema.map(|ts| {
-        let (p, t) = emit_sub_schema("then", ts, defs, counter);
+        let (p, t) = emit_sub_schema("then", ts, defs, counter, mutable);
         *counter += 1;
         let name = format!("_then_ta_{}", *counter);
         (p, t, name)
     });
 
     let else_ta = else_schema.map(|es| {
-        let (p, t) = emit_sub_schema("else", es, defs, counter);
+        let (p, t) = emit_sub_schema("else", es, defs, counter, mutable);
         *counter += 1;
         let name = format!("_else_ta_{}", *counter);
         (p, t, name)
@@ -1616,16 +1617,17 @@ fn emit_union(
     members: &[SchemaIr],
     defs: &[DefEntry],
     counter: &mut usize,
+    mutable: bool,
 ) -> String {
     if members.len() == 1 {
-        return emit_definition(name, &members[0], defs, counter);
+        return emit_definition(name, &members[0], defs, counter, mutable);
     }
 
     let mut out = String::new();
     let mut ta_names = Vec::new();
 
     for member in members {
-        let (sub_preamble, sub_type) = emit_sub_schema("anyof", member, defs, counter);
+        let (sub_preamble, sub_type) = emit_sub_schema("anyof", member, defs, counter, mutable);
         if !sub_preamble.is_empty() {
             out.push_str(&sub_preamble);
             out.push('\n');
@@ -1666,16 +1668,17 @@ fn emit_exclusive_union(
     members: &[SchemaIr],
     defs: &[DefEntry],
     counter: &mut usize,
+    mutable: bool,
 ) -> String {
     if members.len() == 1 {
-        return emit_definition(name, &members[0], defs, counter);
+        return emit_definition(name, &members[0], defs, counter, mutable);
     }
 
     let mut out = String::new();
     let mut ta_names = Vec::new();
 
     for member in members {
-        let (sub_preamble, sub_type) = emit_sub_schema("oneof", member, defs, counter);
+        let (sub_preamble, sub_type) = emit_sub_schema("oneof", member, defs, counter, mutable);
         if !sub_preamble.is_empty() {
             out.push_str(&sub_preamble);
             out.push('\n');
@@ -1718,16 +1721,17 @@ fn emit_intersection(
     members: &[SchemaIr],
     defs: &[DefEntry],
     counter: &mut usize,
+    mutable: bool,
 ) -> String {
     if members.len() == 1 {
-        return emit_definition(name, &members[0], defs, counter);
+        return emit_definition(name, &members[0], defs, counter, mutable);
     }
 
     let mut out = String::new();
     let mut ta_names = Vec::new();
 
     for member in members {
-        let (sub_preamble, sub_type) = emit_sub_schema("inter", member, defs, counter);
+        let (sub_preamble, sub_type) = emit_sub_schema("inter", member, defs, counter, mutable);
         if !sub_preamble.is_empty() {
             out.push_str(&sub_preamble);
             out.push('\n');
@@ -1760,6 +1764,7 @@ fn emit_constrained_array(
     arr: &ArraySchema,
     defs: &[DefEntry],
     counter: &mut usize,
+    mutable: bool,
 ) -> String {
     let item_type = py_type(&arr.items, defs);
     let base_type = format!("list[{item_type}]");
@@ -1779,7 +1784,7 @@ fn emit_constrained_array(
     // contains
     if let Some(contains) = &arr.contains {
         let (sub_preamble, sub_type) =
-            emit_sub_schema("contains", &contains.schema, defs, counter);
+            emit_sub_schema("contains", &contains.schema, defs, counter, mutable);
         if !sub_preamble.is_empty() {
             out.push_str(&sub_preamble);
             out.push('\n');
@@ -1847,6 +1852,7 @@ fn emit_constrained_tuple(
     tuple: &TupleSchema,
     defs: &[DefEntry],
     counter: &mut usize,
+    mutable: bool,
 ) -> String {
     let mut out = String::new();
     let mut checks = Vec::new();
@@ -1854,7 +1860,7 @@ fn emit_constrained_tuple(
     // Item type adapters for each prefix item
     let mut item_tas = Vec::new();
     for (i, item) in tuple.items.iter().enumerate() {
-        let (sub_preamble, sub_type) = emit_sub_schema("ti", item, defs, counter);
+        let (sub_preamble, sub_type) = emit_sub_schema("ti", item, defs, counter, mutable);
         if !sub_preamble.is_empty() {
             out.push_str(&sub_preamble);
             out.push('\n');
@@ -1870,7 +1876,7 @@ fn emit_constrained_tuple(
         None => None,
         Some(rest) if matches!(rest.as_ref(), SchemaIr::Any) => None,
         Some(rest) => {
-            let (sub_preamble, sub_type) = emit_sub_schema("tr", rest, defs, counter);
+            let (sub_preamble, sub_type) = emit_sub_schema("tr", rest, defs, counter, mutable);
             if !sub_preamble.is_empty() {
                 out.push_str(&sub_preamble);
                 out.push('\n');
@@ -1925,7 +1931,7 @@ fn emit_constrained_tuple(
     // contains
     if let Some(contains) = &tuple.contains {
         let (sub_preamble, sub_type) =
-            emit_sub_schema("tc", &contains.schema, defs, counter);
+            emit_sub_schema("tc", &contains.schema, defs, counter, mutable);
         if !sub_preamble.is_empty() {
             out.push_str(&sub_preamble);
             out.push('\n');
@@ -2025,6 +2031,7 @@ fn emit_sub_schema(
     ir: &SchemaIr,
     defs: &[DefEntry],
     counter: &mut usize,
+    mutable: bool,
 ) -> (String, String) {
     match ir {
         SchemaIr::Object(_)
@@ -2041,28 +2048,28 @@ fn emit_sub_schema(
         | SchemaIr::Enum(_) => {
             *counter += 1;
             let sub_name = format!("_{prefix}_{}", *counter);
-            let def = emit_definition(&sub_name, ir, defs, counter);
+            let def = emit_definition(&sub_name, ir, defs, counter, mutable);
             (format!("{def}\n"), sub_name)
         }
         SchemaIr::Intersection(members) if members.len() == 1 => {
-            emit_sub_schema(prefix, &members[0], defs, counter)
+            emit_sub_schema(prefix, &members[0], defs, counter, mutable)
         }
         SchemaIr::Intersection(members) if members.len() > 1 => {
             *counter += 1;
             let sub_name = format!("_{prefix}_{}", *counter);
-            let def = emit_definition(&sub_name, ir, defs, counter);
+            let def = emit_definition(&sub_name, ir, defs, counter, mutable);
             (format!("{def}\n"), sub_name)
         }
         SchemaIr::Union(members) if members.len() > 1 => {
             *counter += 1;
             let sub_name = format!("_{prefix}_{}", *counter);
-            let def = emit_definition(&sub_name, ir, defs, counter);
+            let def = emit_definition(&sub_name, ir, defs, counter, mutable);
             (format!("{def}\n"), sub_name)
         }
         SchemaIr::Array(arr) if arr.unique_items || arr.contains.is_some() => {
             *counter += 1;
             let sub_name = format!("_{prefix}_{}", *counter);
-            let def = emit_definition(&sub_name, ir, defs, counter);
+            let def = emit_definition(&sub_name, ir, defs, counter, mutable);
             (format!("{def}\n"), sub_name)
         }
         _ => (String::new(), annotated_type(ir, defs)),

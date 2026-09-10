@@ -86,7 +86,8 @@ echo '{"type":"string"}' | jst - --target swift --name my-type
 **Collection mode** (`--out-dir`, multiple schemas, or a directory input): one output file per schema plus a shared helpers file at the output root containing exactly the union of helpers the emitted modules need — nothing more. Directory inputs are expanded recursively (`**/*.json`) and their structure is mirrored into the output directory; nested modules reference the root helpers file with depth-aware paths.
 
 ```bash
-# All targets into a directory (single schema still gets a shared helpers file)
+# All targets into a directory (collection mode: a shared helpers file is
+# written when the generated modules need one)
 jst schema.json --out-dir ./generated
 
 # Many schemas, mirrored tree:
@@ -99,7 +100,7 @@ jst schemas/ --target zod --out-dir ./generated
 jst extra.json schemas/ --target zod --out-dir ./generated --helpers-file utils.ts
 ```
 
-The generated root type name is the PascalCased name, resolved in order: `--name` argument (single-file mode), the schema's root `title`, then the input file's stem (library callers get `ConvertError::MissingName` instead of the file-stem fallback). Collection-mode output file stems follow each language's convention: `snake_case` for Python, `PascalCase` otherwise.
+The generated root type name is the PascalCased name, resolved in order: `--name` argument (single-file mode), the schema's root `title`, then the input file's stem (library callers get `ConvertError::MissingName` instead of the file-stem fallback). Collection-mode output file stems follow each language's convention: `snake_case` for Python and Rust, `PascalCase` otherwise.
 
 The shared helpers file — `jst-helpers.ts` / `jst_helpers.py` / `JstHelpers.swift` / `JstHelpers.kt` / `jst_helpers.rs` — is referenced via imports in TypeScript/Python, same-module internal declarations in Swift/Kotlin, and `use super::…::jst_helpers::*;` in Rust (mount the generated tree as a module hierarchy mirroring the directories, with `jst_helpers.rs` a sibling of the root-level files; generated Rust depends on `serde` + `serde_json` + `regex`). Library callers use `CollectionSession` (accumulates helper needs across `emit` calls, then `helpers()` yields the tailored file) or `Emitter::emit_collecting` / `Emitter::helpers_content_for` directly; `EmitOptions { helpers }` carries the helpers file name and the per-module directory prefix.
 

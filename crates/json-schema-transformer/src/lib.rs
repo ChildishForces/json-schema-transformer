@@ -43,6 +43,10 @@ pub(crate) fn resolve_name(
 /// `name` determines the generated root type name (PascalCased). When None,
 /// the schema's root `title` is used; if that is also absent this returns
 /// [`ConvertError::MissingName`].
+///
+/// This and the `json_schema_to_*` convenience functions always emit
+/// single-file mode with default options; use [`transform_with_options`]
+/// for `mutable` output, or [`CollectionSession`] for collection mode.
 pub fn transform(
     schema: &serde_json::Value,
     emitter: &dyn Emitter,
