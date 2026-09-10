@@ -17,4 +17,21 @@ for (payload, expected) in cases {
         print("MISMATCH: \(payload) expected=\(expected) actual=\(actual)")
     }
 }
+
+// Manual construction: the throwing initializer validates on the spot.
+do {
+    let item = try OrderItem(id: "a", quantity: 2)
+    if try item.validatedJSONData().isEmpty {
+        ok = false
+        print("MISMATCH: validatedJSONData returned empty data")
+    }
+} catch {
+    ok = false
+    print("MISMATCH: valid manual construction threw \(error)")
+}
+if (try? OrderItem(id: "a", quantity: 0)) != nil {
+    ok = false
+    print("MISMATCH: OrderItem(id:\"a\", quantity:0) should throw")
+}
+
 print(ok ? "PASS" : "FAIL")

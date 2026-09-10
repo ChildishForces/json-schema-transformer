@@ -1,12 +1,13 @@
 #!/usr/bin/env bun
+import { readFileSync, writeFileSync } from 'fs';
+import { join } from 'path';
+
 // Bumps the workspace version to the given semver:
 //   bun run bump 0.2.0
 //
 // Updates [workspace.package] in the root Cargo.toml (inherited by all
 // crates), the pinned dep version in jst-cli's manifest, and Cargo.lock.
 import { $ } from 'bun';
-import { readFileSync, writeFileSync } from 'fs';
-import { join } from 'path';
 
 const ROOT = join(import.meta.dir, '..');
 const SEMVER =

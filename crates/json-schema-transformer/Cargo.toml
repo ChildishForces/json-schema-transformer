@@ -8,12 +8,13 @@ description = "Transform JSON Schema into native types and validation schemas fo
 
 [features]
 default = []
-all-emitters = ["zod", "typescript", "pydantic", "swift", "kotlin"]
+all-emitters = ["zod", "typescript", "pydantic", "swift", "kotlin", "rust"]
 zod = []
 typescript = []
 pydantic = []
 swift = []
 kotlin = []
+rust = []
 
 [dependencies]
 serde_json = "1"

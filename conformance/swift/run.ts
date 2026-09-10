@@ -1,4 +1,8 @@
 #!/usr/bin/env bun
+import { mkdirSync, readFileSync, writeFileSync } from 'fs';
+import { cpus } from 'os';
+import { basename, join, resolve } from 'path';
+
 /**
  * Swift conformance harness: compile ALL generated fixtures into one binary,
  * run the whole suite in one process.
@@ -11,9 +15,6 @@
  * are marked all-tests-failed with the compiler error as the reason).
  */
 import { $ } from 'bun';
-import { mkdirSync, readFileSync, writeFileSync } from 'fs';
-import { basename, join, resolve } from 'path';
-import { cpus } from 'os';
 
 const HERE = import.meta.dir;
 const GEN_DIR = resolve(HERE, '../generated');
@@ -99,9 +100,10 @@ for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
   const { sources } = generate(exclusions);
   console.log(`compile attempt ${attempt} (${sources.length} fixture files)...`);
 
-  const result = await $`swiftc -Onone -suppress-warnings -j ${ncpu} -module-name ConformanceRunner -o ${join(BUILD, 'runner')} @${join(BUILD, 'sources.txt')} ${join(GEN_DIR, 'swift/JstHelpers.swift')} ${join(BUILD, 'main.swift')}`
-    .quiet()
-    .nothrow();
+  const result =
+    await $`swiftc -Onone -suppress-warnings -j ${ncpu} -module-name ConformanceRunner -o ${join(BUILD, 'runner')} @${join(BUILD, 'sources.txt')} ${join(GEN_DIR, 'swift/JstHelpers.swift')} ${join(BUILD, 'main.swift')}`
+      .quiet()
+      .nothrow();
   lastLog = result.stderr.toString();
 
   if (result.exitCode === 0) {

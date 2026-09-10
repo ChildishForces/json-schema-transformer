@@ -1,13 +1,17 @@
+pub mod collection;
 pub mod emit;
 pub mod input;
 pub mod ir;
 pub mod util;
 
+pub use collection::CollectionSession;
 pub use emit::Emitter;
 #[cfg(feature = "kotlin")]
 pub use emit::KotlinEmitter;
 #[cfg(feature = "pydantic")]
 pub use emit::PydanticEmitter;
+#[cfg(feature = "rust")]
+pub use emit::RustEmitter;
 #[cfg(feature = "swift")]
 pub use emit::SwiftEmitter;
 #[cfg(feature = "typescript")]
@@ -19,7 +23,10 @@ pub use ir::{ConvertedSchema, SchemaIr};
 
 /// Resolve the module/type name: explicit argument first, then the schema's
 /// root `title`. Errors when neither is available.
-fn resolve_name(schema: &serde_json::Value, name: Option<&str>) -> Result<String, ConvertError> {
+pub(crate) fn resolve_name(
+    schema: &serde_json::Value,
+    name: Option<&str>,
+) -> Result<String, ConvertError> {
     if let Some(n) = name {
         return Ok(n.to_string());
     }
@@ -36,6 +43,10 @@ fn resolve_name(schema: &serde_json::Value, name: Option<&str>) -> Result<String
 /// `name` determines the generated root type name (PascalCased). When None,
 /// the schema's root `title` is used; if that is also absent this returns
 /// [`ConvertError::MissingName`].
+///
+/// This and the `json_schema_to_*` convenience functions always emit
+/// single-file mode with default options; use [`transform_with_options`]
+/// for `mutable` output, or [`CollectionSession`] for collection mode.
 pub fn transform(
     schema: &serde_json::Value,
     emitter: &dyn Emitter,
@@ -99,6 +110,15 @@ pub fn json_schema_to_kotlin(
     name: Option<&str>,
 ) -> Result<String, ConvertError> {
     transform(schema, &KotlinEmitter, name)
+}
+
+/// Convert a JSON Schema to Rust serde types with validating deserialization.
+#[cfg(feature = "rust")]
+pub fn json_schema_to_rust(
+    schema: &serde_json::Value,
+    name: Option<&str>,
+) -> Result<String, ConvertError> {
+    transform(schema, &RustEmitter, name)
 }
 
 #[cfg(all(test, feature = "zod"))]

@@ -7,8 +7,9 @@
  *   bun scripts/test.ts --quick  # skip conformance suites
  */
 
-import { $ } from 'bun';
 import { existsSync, readFileSync } from 'fs';
+
+import { $ } from 'bun';
 
 const SPINNER_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 const CHECK = '\x1b[32m✔\x1b[0m';
@@ -68,6 +69,7 @@ const suites: Suite[] = [
       'conformance/python/integration.test.ts',
       'conformance/swift/integration.test.ts',
       'conformance/kotlin/integration.test.ts',
+      'conformance/rust/integration.test.ts',
     ],
     cwd: REPO_ROOT,
     extract: (out) => {
@@ -118,6 +120,14 @@ const suites: Suite[] = [
     command: ['bun', 'conformance/kotlin/run.ts'],
     cwd: REPO_ROOT,
     resultsFile: 'conformance/results/kotlin.json',
+    skip: quick,
+  },
+  {
+    name: 'Rust conformance',
+    phase: 'conformance',
+    command: ['bun', 'conformance/rust/run.ts'],
+    cwd: REPO_ROOT,
+    resultsFile: 'conformance/results/rust.json',
     skip: quick,
   },
 ];

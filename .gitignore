@@ -10,6 +10,7 @@ node_modules/
 /conformance/kotlin/build/
 /conformance/kotlin/libs/
 /conformance/kotlin/toolchain/
+/conformance/rust/build/
 
 # Integration test scratch dirs
 conformance/*/.itest/

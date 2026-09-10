@@ -10,8 +10,9 @@ use std::path::PathBuf;
 use anyhow::Context;
 use clap::Parser;
 use json_schema_transformer::input::Converter;
+use json_schema_transformer::CollectionSession;
 use json_schema_transformer::emit::{
-    EmitOptions, Emitter, KotlinEmitter, PydanticEmitter, SwiftEmitter, ZodEmitter,
+    Emitter, KotlinEmitter, PydanticEmitter, RustEmitter, SwiftEmitter, ZodEmitter,
 };
 use serde::Serialize;
 
@@ -144,7 +145,7 @@ fn to_snake_case(s: &str) -> String {
 }
 
 fn emit_guarded(
-    emitter: &dyn Emitter,
+    session: &mut CollectionSession<'_>,
     schema: &serde_json::Value,
     name: &str,
     remotes: &std::collections::HashMap<String, serde_json::Value>,
@@ -154,11 +155,11 @@ fn emit_guarded(
         // that profile (format enforcement is this library's opt-in extension)
         let converted = Converter::convert_with_options(schema, remotes, false)
             .map_err(|e| e.to_string())?;
-        // Shared-helpers mode: utilities live in one companion file per language
-        let options = EmitOptions {
-            helpers_file: emitter.default_helpers_file().map(|s| s.to_string()),
-        };
-        Ok(emitter.emit_with_options(&converted, name, &options))
+        // Collection mode: utilities live in one companion file per language,
+        // tailored to the union of needs across all successfully emitted
+        // fixtures (a panic aborts before the union is recorded). Flat
+        // fixture layout → no dir prefix.
+        Ok(session.emit_converted(&converted, name, ""))
     }));
     match result {
         Ok(inner) => inner,
@@ -191,17 +192,18 @@ fn main() -> anyhow::Result<()> {
         ("pydantic", Box::new(PydanticEmitter)),
         ("swift", Box::new(SwiftEmitter)),
         ("kotlin", Box::new(KotlinEmitter)),
+        ("rust", Box::new(RustEmitter)),
     ];
 
-    for (lang, emitter) in &langs {
+    for (lang, _) in &langs {
         std::fs::create_dir_all(args.out.join(lang))?;
-        // Write the language's shared helpers file once
-        if let (Some(filename), Some(content)) =
-            (emitter.default_helpers_file(), emitter.helpers_content())
-        {
-            std::fs::write(args.out.join(lang).join(filename), content)?;
-        }
     }
+    // One session per language accumulates helper needs across all fixtures;
+    // the tailored helpers files are written after the group loop.
+    let mut sessions: Vec<CollectionSession<'_>> = langs
+        .iter()
+        .map(|(_, emitter)| CollectionSession::new(emitter.as_ref()))
+        .collect();
 
     let mut groups: Vec<ManifestGroup> = Vec::new();
     let mut error_count = 0usize;
@@ -220,13 +222,14 @@ fn main() -> anyhow::Result<()> {
             let mut files = BTreeMap::new();
             let mut errors = BTreeMap::new();
 
-            for (lang, emitter) in &langs {
-                match emit_guarded(emitter.as_ref(), &group.schema, &name, &remotes) {
+            for ((lang, emitter), session) in langs.iter().zip(sessions.iter_mut()) {
+                match emit_guarded(session, &group.schema, &name, &remotes) {
                     Ok(code) => {
                         let rel = match *lang {
                             "pydantic" => format!("pydantic/{}.py", to_snake_case(&name)),
                             "swift" => format!("swift/{pascal}.swift"),
                             "kotlin" => format!("kotlin/{pascal}.kt"),
+                            "rust" => format!("rust/{}.rs", to_snake_case(&name)),
                             _ => format!("{lang}/{name}.{}", emitter.extension()),
                         };
                         std::fs::write(args.out.join(&rel), code)?;
@@ -261,6 +264,14 @@ fn main() -> anyhow::Result<()> {
             .unwrap_or_default(),
         groups,
     };
+
+    // Tailored shared helpers: exactly the union of components the emitted
+    // fixtures reference per language.
+    for ((lang, _), session) in langs.iter().zip(sessions.iter()) {
+        if let Some((filename, content)) = session.helpers() {
+            std::fs::write(args.out.join(lang).join(filename), content)?;
+        }
+    }
 
     let manifest_path = args.out.join("manifest.json");
     std::fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?)?;
